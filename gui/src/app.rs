@@ -365,13 +365,9 @@ fn license_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
 // Settings dialog
 // ---------------------------------------------------------------------------
 
-/// Open the Settings dialog, prefilling the saved token + theme + font size.
+/// Open the Settings dialog, prefilling the saved theme + font size.
 fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
-    let (token, dark) = {
-        let c = ctrl.borrow();
-        (c.settings.api_token.clone(), c.settings.theme_is_dark())
-    };
-    w.set_settings_token(SharedString::from(token));
+    let dark = ctrl.borrow().settings.theme_is_dark();
     // Reflect the current theme in the selector; remember it so Cancel can
     // revert a live preview.
     w.set_settings_theme_index(if dark { 1 } else { 0 });
@@ -386,16 +382,13 @@ fn open_settings_dialog(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
     w.set_show_settings(true);
 }
 
-/// Save the token + theme + font size + network-shares toggle from the
-/// Settings dialog.
+/// Save the theme + font size + network-shares toggle from the Settings dialog.
 fn settings_save(ctrl: &Rc<RefCell<Controller>>, w: &MainWindow) {
-    let token = w.get_settings_token().trim().to_string();
     let dark = w.get_settings_theme_index() != 0;
     let font_idx = w.get_settings_font_index();
     let show_network = w.get_settings_show_network();
     let (result, network_changed) = {
         let mut c = ctrl.borrow_mut();
-        c.settings.api_token = token;
         c.settings.theme = if dark { "Dark".into() } else { "Light".into() };
         c.settings.font_size = Settings::font_size_from_index(font_idx);
         let network_changed = c.settings.show_network_shares != show_network;

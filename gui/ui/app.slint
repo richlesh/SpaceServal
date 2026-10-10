@@ -203,7 +203,6 @@ export component MainWindow inherits Window {
     in property <bool> license-valid: false;
     in property <string> license-msg;
     in property <bool> show-settings: false;
-    in-out property <string> settings-token;
     // Theme selector: 0 = Light, 1 = Dark (matches the Settings ComboBox model).
     in-out property <int> settings-theme-index: 1;
     // Font size selector: 0 = System, 1 = Small, 2 = Medium, 3 = Large.
@@ -618,15 +617,6 @@ export component MainWindow inherits Window {
                 CheckBox {
                     text: "Show Network Shares";
                     checked <=> root.settings-show-network;
-                }
-                Text { text: "API Token"; color: Theme.text; }
-                ClipField {
-                    placeholder-text: "Paste your API token";
-                    password: true;
-                    text <=> root.settings-token;
-                    edit-op: root.edit-op;
-                    edit-serial: root.edit-serial;
-                    accepted => { root.settings-save(); }
                 }
                 HorizontalBox {
                     alignment: end;

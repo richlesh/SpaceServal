@@ -81,9 +81,6 @@ pub struct Settings {
     /// Number of successful operations, used to show the splash every N.
     #[serde(default)]
     pub use_count: u64,
-    /// Optional API token for an external service (generic app setting).
-    #[serde(default)]
-    pub api_token: String,
     /// UI theme: "Light" or "Dark". Defaults to Dark (see `default_theme`) so
     /// existing settings files without this field keep the original look.
     #[serde(default = "default_theme")]

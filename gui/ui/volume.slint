@@ -104,6 +104,16 @@ export component VolumeWindow inherits Window {
         }
     }
 
+    // Report the wedge under the pointer by angle (clockwise from 12 o'clock),
+    // so the controller can set `hovered-name`. Reads the pie TouchArea's live
+    // pointer position.
+    function report-hover() {
+        root.hover-at-angle(Math.mod(
+            Math.atan2((pie-touch.mouse-x - pie.width / 2) / 1px,
+                       -(pie-touch.mouse-y - pie.height / 2) / 1px)
+                / 1deg + 360, 360));
+    }
+
     VerticalBox {
         padding: 16px;
         spacing: 12px;
@@ -125,19 +135,6 @@ export component VolumeWindow inherits Window {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
                 overflow: elide;
-            }
-            // Animated "Working…" shown while a scan is still expanding
-            // directories. A timer flips `working-bright` on a cadence and the
-            // opacity animates between dim and bright, so it fades in and out
-            // continuously until `scanning` turns false.
-            Text {
-                text: "Working…";
-                color: root.muted;
-                font-italic: true;
-                vertical-alignment: center;
-                visible: root.scanning;
-                opacity: root.working-bright ? 1.0 : 0.15;
-                animate opacity { duration: 650ms; easing: ease-in-out; }
             }
         }
 
@@ -183,16 +180,16 @@ export component VolumeWindow inherits Window {
                                            -(self.mouse-y - pie.height / 2) / 1px)
                                     / 1deg + 360, 360));
                         }
-                        // Hover: report the pointer angle so the controller can
-                        // set `hovered-name` to the wedge's basename.
-                        moved => {
-                            root.hover-at-angle(Math.mod(
-                                Math.atan2((self.mouse-x - pie.width / 2) / 1px,
-                                           -(self.mouse-y - pie.height / 2) / 1px)
-                                    / 1deg + 360, 360));
-                        }
+                        // Hover tracking. `TouchArea.moved` only fires while a
+                        // button is held, so instead watch the pointer position
+                        // reactively: whenever it changes while hovering, report
+                        // the angle so the controller sets `hovered-name`.
+                        changed mouse-x => { root.report-hover(); }
+                        changed mouse-y => { root.report-hover(); }
                         changed has-hover => {
-                            if (!self.has-hover) {
+                            if (self.has-hover) {
+                                root.report-hover();
+                            } else {
                                 root.hover-clear();
                             }
                         }
@@ -218,11 +215,28 @@ export component VolumeWindow inherits Window {
                     }
                 }
 
-                if root.wedges.length == 0: Text {
-                    text: root.scanning ? "Scanning…" : "Empty or unreadable";
+                // Empty / unreadable directory (only when not actively scanning).
+                if root.wedges.length == 0 && !root.scanning: Text {
+                    text: "Empty or unreadable";
                     color: root.muted;
                     horizontal-alignment: center;
                     vertical-alignment: center;
+                }
+
+                // Animated "Working…" shown while a scan is still expanding
+                // directories. A timer flips `working-bright` on a cadence and
+                // the opacity animates between dim and bright, so it fades in
+                // and out continuously until `scanning` turns false. Placed at
+                // the bottom-center so it's visible over the (growing) pie.
+                if root.scanning: Text {
+                    text: "Working…";
+                    color: root.text;
+                    font-italic: true;
+                    font-size: root.base-font-size + 1px;
+                    horizontal-alignment: center;
+                    y: parent.height - self.preferred-height - 4px;
+                    opacity: root.working-bright ? 1.0 : 0.1;
+                    animate opacity { duration: 650ms; easing: ease-in-out; }
                 }
             }
 
