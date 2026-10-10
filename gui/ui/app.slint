@@ -112,6 +112,10 @@ component ClipField inherits Rectangle {
     // 4=select-all; serial increments on each request.
     in property <int> edit-op;
     in property <int> edit-serial;
+    // Bumped by the owner after it programmatically rewrites `text` (e.g. live
+    // reformatting). Setting `text` from outside doesn't move the caret, which
+    // would strand it mid-string; on each bump we move the cursor to the end.
+    in property <int> cursor-end-serial;
     callback accepted();
     callback edited();
 
@@ -124,6 +128,12 @@ component ClipField inherits Rectangle {
             if root.edit-op == 3 { ti.paste(); }
             if root.edit-op == 4 { ti.select-all(); }
         }
+    }
+
+    // Move the caret to the end after a programmatic reformat. Slint clamps
+    // out-of-range offsets, so a large value lands at the end of the text.
+    changed cursor-end-serial => {
+        ti.set-selection-offsets(1000000, 1000000);
     }
 
     height: 32px;
@@ -232,6 +242,9 @@ export component MainWindow inherits Window {
     // has focus.
     property <int> edit-op: 0;
     property <int> edit-serial: 0;
+    // Bumped by the controller after it live-reformats the license key, so the
+    // key field can move its caret back to the end.
+    in-out property <int> license-key-cursor-serial: 0;
 
     // ---- Callbacks (wired to the controller) --------------------------
     callback open-settings();
@@ -249,13 +262,19 @@ export component MainWindow inherits Window {
     callback theme-changed(int);
     callback font-size-changed(int);
 
-    // ---- Edit-menu routing (Windows/Linux) ----------------------------
+    // ---- Edit-menu routing --------------------------------------------
     // Broadcast an op to the focused ClipField by bumping the serial. See the
-    // `edit-op`/`edit-serial` properties above.
-    function edit-cut() { root.edit-op = 1; root.edit-serial += 1; }
-    function edit-copy() { root.edit-op = 2; root.edit-serial += 1; }
-    function edit-paste() { root.edit-op = 3; root.edit-serial += 1; }
-    function edit-select-all() { root.edit-op = 4; root.edit-serial += 1; }
+    // `edit-op`/`edit-serial` properties above. These are callbacks (not plain
+    // functions) so the native macOS menu (built in Rust) can invoke them too;
+    // the Windows/Linux Slint MenuBar calls them directly.
+    callback edit-cut();
+    callback edit-copy();
+    callback edit-paste();
+    callback edit-select-all();
+    edit-cut => { root.edit-op = 1; root.edit-serial += 1; }
+    edit-copy => { root.edit-op = 2; root.edit-serial += 1; }
+    edit-paste => { root.edit-op = 3; root.edit-serial += 1; }
+    edit-select-all => { root.edit-op = 4; root.edit-serial += 1; }
 
     // ---- Main window shell --------------------------------------------
     // Windows/Linux menu bar. Guarded so it is only built off-macOS; on macOS
@@ -557,6 +576,7 @@ export component MainWindow inherits Window {
                     text <=> root.license-key;
                     edit-op: root.edit-op;
                     edit-serial: root.edit-serial;
+                    cursor-end-serial: root.license-key-cursor-serial;
                     edited => { root.license-key-edited(); }
                     accepted => { if root.license-valid { root.license-save(); } }
                 }

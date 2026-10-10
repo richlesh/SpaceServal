@@ -219,6 +219,9 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
                 let formatted = crate::license_mgr::format_key(&w.get_license_key());
                 if formatted != w.get_license_key().as_str() {
                     w.set_license_key(SharedString::from(formatted.clone()));
+                    // Setting `text` doesn't move the caret, so nudge the field
+                    // to put it back at the end after the reformat.
+                    w.set_license_key_cursor_serial(w.get_license_key_cursor_serial() + 1);
                 }
                 let valid = crate::license_mgr::is_valid(&formatted, &w.get_license_email());
                 w.set_license_valid(valid);

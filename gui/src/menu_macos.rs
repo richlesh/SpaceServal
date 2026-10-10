@@ -27,6 +27,15 @@ use crate::app::MainWindow;
 const ID_ABOUT: &str = "app.about";
 const ID_SETTINGS: &str = "app.settings";
 const ID_LICENSE: &str = "help.license";
+// Edit items. macOS predefined Cut/Copy/Paste use the AppKit responder chain,
+// which never reaches Slint's `TextInput` (it isn't an NSText responder), so
+// paste etc. silently do nothing in our dialog fields. Use custom items that
+// dispatch to the window's edit callbacks (the same broadcast the Windows/Linux
+// menu uses) and keep the standard Cmd-X/C/V/A accelerators.
+const ID_CUT: &str = "edit.cut";
+const ID_COPY: &str = "edit.copy";
+const ID_PASTE: &str = "edit.paste";
+const ID_SELECT_ALL: &str = "edit.select_all";
 
 /// Build the native macOS menu, install it as the application menu, and start
 /// polling for menu events (routing them to the window's callbacks).
@@ -74,19 +83,43 @@ pub fn install(window: &MainWindow) -> Menu {
         .unwrap();
 
     // ---- Edit -----------------------------------------------------------
-    // All predefined so the native Cut/Copy/Paste shortcuts and responder
-    // chain behaviour work out of the box.
+    // Custom items (with the usual accelerators) that route to the window so
+    // the ops reach our Slint TextInputs. Undo/Redo stay predefined.
     let edit_menu = Submenu::new("Edit", true);
+    let cut_item = MenuItem::with_id(
+        ID_CUT,
+        "Cut",
+        true,
+        Some(Accelerator::new(Some(Modifiers::META), Code::KeyX)),
+    );
+    let copy_item = MenuItem::with_id(
+        ID_COPY,
+        "Copy",
+        true,
+        Some(Accelerator::new(Some(Modifiers::META), Code::KeyC)),
+    );
+    let paste_item = MenuItem::with_id(
+        ID_PASTE,
+        "Paste",
+        true,
+        Some(Accelerator::new(Some(Modifiers::META), Code::KeyV)),
+    );
+    let select_all_item = MenuItem::with_id(
+        ID_SELECT_ALL,
+        "Select All",
+        true,
+        Some(Accelerator::new(Some(Modifiers::META), Code::KeyA)),
+    );
     menu.append(&edit_menu).unwrap();
     edit_menu
         .append_items(&[
             &PredefinedMenuItem::undo(None),
             &PredefinedMenuItem::redo(None),
             &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::cut(None),
-            &PredefinedMenuItem::copy(None),
-            &PredefinedMenuItem::paste(None),
-            &PredefinedMenuItem::select_all(None),
+            &cut_item,
+            &copy_item,
+            &paste_item,
+            &select_all_item,
         ])
         .unwrap();
 
@@ -131,6 +164,10 @@ fn dispatch(window: &MainWindow, id: &MenuId) {
         ID_ABOUT => window.invoke_open_about(),
         ID_SETTINGS => window.invoke_open_settings(),
         ID_LICENSE => window.invoke_open_license(),
+        ID_CUT => window.invoke_edit_cut(),
+        ID_COPY => window.invoke_edit_copy(),
+        ID_PASTE => window.invoke_edit_paste(),
+        ID_SELECT_ALL => window.invoke_edit_select_all(),
         _ => {}
     }
 }
