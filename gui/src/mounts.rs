@@ -647,14 +647,26 @@ mod tests {
         use super::network::is_network_share;
         // SMB/NFS/AFP: shares regardless of the browse flag.
         assert!(is_network_share("smbfs", true, false));
-        assert!(is_network_share("smbfs", true, true), "nobrowse SMB still a share");
-        assert!(is_network_share("nfs", false, false), "network fs even if flagged local");
+        assert!(
+            is_network_share("smbfs", true, true),
+            "nobrowse SMB still a share"
+        );
+        assert!(
+            is_network_share("nfs", false, false),
+            "network fs even if flagged local"
+        );
         assert!(is_network_share("afpfs", true, false));
         assert!(is_network_share("webdav", true, false));
         // Unknown fstype: a share only when non-local and browsable.
         assert!(is_network_share("myproto", true, false));
-        assert!(!is_network_share("myproto", true, true), "nobrowse unknown is not shown");
-        assert!(!is_network_share("myproto", false, false), "local unknown is not a share");
+        assert!(
+            !is_network_share("myproto", true, true),
+            "nobrowse unknown is not shown"
+        );
+        assert!(
+            !is_network_share("myproto", false, false),
+            "local unknown is not a share"
+        );
         // Local volumes are never network shares.
         assert!(!is_network_share("apfs", false, false));
         assert!(!is_network_share("apfs", false, true));

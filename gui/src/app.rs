@@ -110,7 +110,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     // Populate the mounted drives / mount points list shown in the main window.
     refresh_mounts(&window, ctrl.borrow().settings.show_network_shares);
-    if let Ok(dir) = std::env::var("SS_VERIFY_VOLUME") { open_volume_window(&ctrl, &window, &dir); }
+    if let Ok(dir) = std::env::var("SS_VERIFY_VOLUME") {
+        open_volume_window(&ctrl, &window, &dir);
+    }
 
     // macOS: install the native menu bar (File/Edit/Help plus About and
     // Settings in the Application menu, License Key under Help). The returned
@@ -870,11 +872,7 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                    let label = if *is_dir {
-                        format!("{name}/")
-                    } else {
-                        name
-                    };
+                    let label = if *is_dir { format!("{name}/") } else { name };
                     let result = if *is_dir {
                         std::fs::remove_dir_all(path)
                     } else {

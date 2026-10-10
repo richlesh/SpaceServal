@@ -629,9 +629,9 @@ mod tests {
         // green-dominant, 240° is blue-dominant. Each wedge's `color` must
         // match `wedge_color(start_deg)` exactly, so the pie and legend agree.
         let hues = [
-            (0.0f32, (true, false, false)),   // red
-            (120.0, (false, true, false)),    // green
-            (240.0, (false, false, true)),    // blue
+            (0.0f32, (true, false, false)), // red
+            (120.0, (false, true, false)),  // green
+            (240.0, (false, false, true)),  // blue
         ];
         for (hue, (r_max, g_max, b_max)) in hues {
             let c = wedge_color(hue);
@@ -654,8 +654,18 @@ mod tests {
         // hue 0 (red), and its color equals wedge_color(start_deg).
         let scan = DirScan {
             entries: vec![
-                Entry { name: "a".into(), path: "/a".into(), is_dir: true, size_bytes: 50 },
-                Entry { name: "b".into(), path: "/b".into(), is_dir: false, size_bytes: 50 },
+                Entry {
+                    name: "a".into(),
+                    path: "/a".into(),
+                    is_dir: true,
+                    size_bytes: 50,
+                },
+                Entry {
+                    name: "b".into(),
+                    path: "/b".into(),
+                    is_dir: false,
+                    size_bytes: 50,
+                },
             ],
             total_bytes: 100,
         };
@@ -672,7 +682,11 @@ mod tests {
         let r = u8::from_str_radix(&first.color[1..3], 16).unwrap();
         let g = u8::from_str_radix(&first.color[3..5], 16).unwrap();
         let b = u8::from_str_radix(&first.color[5..7], 16).unwrap();
-        assert!(r >= g && r >= b, "first wedge should be red: {}", first.color);
+        assert!(
+            r >= g && r >= b,
+            "first wedge should be red: {}",
+            first.color
+        );
     }
 
     #[test]
@@ -849,7 +863,12 @@ mod tests {
 
         // Firmlinked Data entries read as the same logical volume as `/`, so the
         // scanner descends into them and reports their real sizes.
-        for p in ["/System/Volumes/Data", "/Users", "/Applications", "/private"] {
+        for p in [
+            "/System/Volumes/Data",
+            "/Users",
+            "/Applications",
+            "/private",
+        ] {
             let path = Path::new(p);
             if let Ok(m) = fs::metadata(path) {
                 assert_eq!(
@@ -872,7 +891,9 @@ mod tests {
         // But the Data *backing* mount is not descended into (its contents are
         // already counted via the firmlinks), so we don't double-count it.
         assert!(is_firmlink_backing_path(Path::new("/System/Volumes/Data")));
-        assert!(is_firmlink_backing_path(Path::new("/System/Volumes/Data/Users")));
+        assert!(is_firmlink_backing_path(Path::new(
+            "/System/Volumes/Data/Users"
+        )));
         assert!(is_firmlink_backing_path(Path::new("/System/Volumes/VM")));
         assert!(!is_firmlink_backing_path(Path::new("/Users")));
         assert!(!is_firmlink_backing_path(Path::new("/System/Library")));
