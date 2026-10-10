@@ -42,6 +42,10 @@ struct VolState {
     root: std::path::PathBuf,
     /// Directory currently displayed.
     current: std::path::PathBuf,
+    /// Per-row selection flags, parallel to the window's `wedges` model.
+    selected: Vec<bool>,
+    /// Anchor row for Shift-range selection (the last plainly-clicked row).
+    anchor: Option<usize>,
 }
 
 pub fn run() -> Result<(), slint::PlatformError> {
@@ -530,11 +534,17 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
     win.set_theme_dark(main.get_theme_dark());
     win.set_base_font_size(main.get_base_font_size());
     win.set_window_icon(main.get_window_icon());
+    // Windows/Linux use the Slint declarative menu bar; macOS gets a native
+    // menu installed below.
+    #[cfg(not(target_os = "macos"))]
+    win.set_use_slint_menubar(true);
 
     let root = std::path::PathBuf::from(mount_point);
     let state = Rc::new(RefCell::new(VolState {
         root: root.clone(),
         current: root.clone(),
+        selected: Vec::new(),
+        anchor: None,
     }));
 
     // Drill into the entry at `index` in the current wedge model (legend row or
@@ -629,48 +639,131 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
         }
     });
 
-    // "What is this File…": open a reference lookup for the entry in the
-    // browser. We don't scrape a third-party API — opening the user's browser
-    // to an authoritative page (or a search) is robust and ToS-safe.
-    win.on_explain_item({
+    // Selection: plain click selects one row; Shift extends a contiguous range
+    // from the anchor; Ctrl/Cmd toggles the row (discontiguous). The resulting
+    // mask is pushed back into the window.
+    win.on_select({
+        let state = state.clone();
         let handle = win.as_weak();
-        move |index| {
+        move |index, shift, toggle| {
+            if index < 0 {
+                return;
+            }
+            let index = index as usize;
             if let Some(w) = handle.upgrade() {
-                if let Some(e) = entry_at(&w, index) {
-                    let _ = webbrowser_open(&explain_url(&e.0, e.1));
+                let count = w.get_wedges().row_count();
+                let mut s = state.borrow_mut();
+                if s.selected.len() != count {
+                    s.selected = vec![false; count];
                 }
+                if index >= count {
+                    return;
+                }
+                let anchor = s.anchor;
+                let new_anchor = apply_selection(&mut s.selected, anchor, index, shift, toggle);
+                s.anchor = new_anchor;
+                push_selection(&w, &s.selected);
             }
         }
     });
 
-    // "Delete Immediately…": permanently remove the entry (no trash, no undo),
-    // then re-scan the current directory so the chart reflects the change.
-    win.on_delete_item({
+    // "What is this File": populate and show the explanation dialog for every
+    // selected entry.
+    win.on_explain_selection({
         let state = state.clone();
         let handle = win.as_weak();
-        move |index| {
+        move || {
             if let Some(w) = handle.upgrade() {
-                if let Some((path, is_dir)) = entry_at(&w, index) {
-                    let result = if is_dir {
-                        std::fs::remove_dir_all(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    };
-                    match result {
-                        Ok(()) => {
-                            // The directory contents changed; drop cached scans
-                            // for it and re-scan so sizes/wedges update.
-                            let current = state.borrow().current.clone();
-                            scan_cache_invalidate_under(&current);
-                            rescan_volume(&w, &state);
-                        }
-                        Err(e) => {
-                            tracing::warn!("delete failed for {}: {e}", path.display());
-                        }
-                    }
+                let paths = selected_paths(&w, &state.borrow().selected);
+                if paths.is_empty() {
+                    return;
                 }
+                let rows: Vec<ExplainEntry> = paths
+                    .iter()
+                    .map(|(p, is_dir)| {
+                        let e = crate::file_info::describe(p, *is_dir);
+                        ExplainEntry {
+                            name: SharedString::from(e.name),
+                            format: SharedString::from(e.format),
+                            purpose: SharedString::from(e.purpose),
+                            safe_to_delete: SharedString::from(e.safe_to_delete),
+                            online_url: SharedString::from(e.online_url),
+                        }
+                    })
+                    .collect();
+                w.set_explain_entries(ModelRc::new(VecModel::from(rows)));
+                w.set_show_explain(true);
             }
         }
+    });
+
+    // "Delete Immediately…": open the confirmation ("chicken") dialog listing
+    // what will be permanently removed. The actual delete happens in
+    // `on_confirm_delete`.
+    win.on_delete_selection({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                let paths = selected_paths(&w, &state.borrow().selected);
+                if paths.is_empty() {
+                    return;
+                }
+                let names = paths
+                    .iter()
+                    .map(|(p, is_dir)| {
+                        let n = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if *is_dir {
+                            format!("• {n}/  (folder — includes its contents)")
+                        } else {
+                            format!("• {n}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                w.set_confirm_names(SharedString::from(names));
+                w.set_show_confirm_delete(true);
+            }
+        }
+    });
+
+    // Confirmed: permanently delete each selected entry (no trash, no undo),
+    // then invalidate the cache and re-scan so the chart updates.
+    win.on_confirm_delete({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                let paths = selected_paths(&w, &state.borrow().selected);
+                for (path, is_dir) in &paths {
+                    let result = if *is_dir {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!("delete failed for {}: {e}", path.display());
+                    }
+                }
+                // Clear the selection and refresh from disk.
+                {
+                    let mut s = state.borrow_mut();
+                    s.selected.clear();
+                    s.anchor = None;
+                    let current = s.current.clone();
+                    scan_cache_invalidate_under(&current);
+                }
+                rescan_volume(&w, &state);
+            }
+        }
+    });
+
+    // Open a reference URL (the explain dialog's "Look up online" link).
+    win.on_open_url(|url| {
+        let _ = webbrowser_open(&url);
     });
 
     // The volume label: the mount's last path component, or the whole path for
@@ -707,6 +800,14 @@ fn rescan_volume(win: &VolumeWindow, state: &Rc<RefCell<VolState>>) {
     // Bump the generation so a slower earlier scan can't overwrite this one.
     let generation = win.get_scan_generation().wrapping_add(1);
     win.set_scan_generation(generation);
+
+    // A new directory's rows don't correspond to the old selection; clear it.
+    {
+        let mut s = state.borrow_mut();
+        s.selected.clear();
+        s.anchor = None;
+    }
+    push_selection(win, &[]);
 
     // Update the path + Up button and show a "scanning" state immediately.
     win.set_current_path(SharedString::from(current.to_string_lossy().into_owned()));
@@ -809,60 +910,63 @@ fn parent_within_root(
     }
 }
 
-/// The entry (absolute path, is-dir) at `index` in the window's current wedge
-/// model, or `None` for an out-of-range index or the synthetic "Other" row
-/// (which has an empty path and must not be explained or deleted).
-fn entry_at(w: &VolumeWindow, index: i32) -> Option<(std::path::PathBuf, bool)> {
-    if index < 0 {
-        return None;
+/// Update `mask` in place for a click on `index` and return the new anchor.
+/// `toggle` (Ctrl/Cmd) flips just that row; `shift` selects the contiguous
+/// range from the anchor to `index`; a plain click selects only `index`.
+/// `index` is assumed in range for `mask`.
+fn apply_selection(
+    mask: &mut [bool],
+    anchor: Option<usize>,
+    index: usize,
+    shift: bool,
+    toggle: bool,
+) -> Option<usize> {
+    if toggle {
+        mask[index] = !mask[index];
+        Some(index)
+    } else if shift {
+        let a = anchor.unwrap_or(index).min(mask.len().saturating_sub(1));
+        let (lo, hi) = (a.min(index), a.max(index));
+        for b in mask.iter_mut() {
+            *b = false;
+        }
+        for b in &mut mask[lo..=hi] {
+            *b = true;
+        }
+        // Keep the original anchor so further Shift-clicks pivot around it.
+        Some(a)
+    } else {
+        for b in mask.iter_mut() {
+            *b = false;
+        }
+        mask[index] = true;
+        Some(index)
     }
-    let row = w.get_wedges().row_data(index as usize)?;
-    if row.path.is_empty() {
-        return None;
-    }
-    Some((std::path::PathBuf::from(row.path.as_str()), row.is_dir))
 }
 
-/// A browser URL that explains what a file/directory is. For a directory we
-/// just search for the name; for a file we look its extension up on fileinfo's
-/// extension reference, falling back to a web search when there's no extension.
-fn explain_url(path: &std::path::Path, is_dir: bool) -> String {
-    let encode = |s: &str| {
-        // Minimal percent-encoding for a query string.
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(b as char)
-                }
-                b' ' => out.push('+'),
-                _ => out.push_str(&format!("%{b:02X}")),
+/// Push the selection mask into the window and update the selection count.
+fn push_selection(w: &VolumeWindow, selected: &[bool]) {
+    let count = selected.iter().filter(|b| **b).count() as i32;
+    w.set_selected(ModelRc::new(VecModel::from(selected.to_vec())));
+    w.set_selection_count(count);
+}
+
+/// The (absolute path, is-dir) of each currently-selected legend row, skipping
+/// the synthetic "Other" grouping row (which has an empty path).
+fn selected_paths(w: &VolumeWindow, selected: &[bool]) -> Vec<(std::path::PathBuf, bool)> {
+    let wedges = w.get_wedges();
+    let mut out = Vec::new();
+    for (i, &sel) in selected.iter().enumerate() {
+        if !sel {
+            continue;
+        }
+        if let Some(row) = wedges.row_data(i) {
+            if !row.path.is_empty() {
+                out.push((std::path::PathBuf::from(row.path.as_str()), row.is_dir));
             }
         }
-        out
-    };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if is_dir {
-        return format!(
-            "https://duckduckgo.com/?q={}",
-            encode(&format!("{name} folder"))
-        );
     }
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) if !ext.is_empty() => {
-            format!(
-                "https://fileinfo.com/extension/{}",
-                encode(&ext.to_lowercase())
-            )
-        }
-        _ => format!(
-            "https://duckduckgo.com/?q={}",
-            encode(&format!("{name} file"))
-        ),
-    }
+    out
 }
 
 /// Parse a `#rrggbb` string into a Slint color (opaque; falls back to gray).
@@ -882,7 +986,7 @@ fn parse_hex_color(s: &str) -> slint::Color {
 #[cfg(test)]
 mod tests {
     use super::{
-        explain_url, parent_within_root, parse_hex_color, scan_cache_get,
+        apply_selection, parent_within_root, parse_hex_color, scan_cache_get,
         scan_cache_invalidate_under, scan_cache_put,
     };
     use std::path::{Path, PathBuf};
@@ -946,26 +1050,34 @@ mod tests {
     }
 
     #[test]
-    fn explain_url_by_kind_and_extension() {
-        // A file with an extension -> fileinfo extension reference (lowercased).
-        assert_eq!(
-            explain_url(Path::new("/x/Report.PDF"), false),
-            "https://fileinfo.com/extension/pdf"
-        );
-        // A directory -> a web search for "<name> folder".
-        assert_eq!(
-            explain_url(Path::new("/x/Caches"), true),
-            "https://duckduckgo.com/?q=Caches+folder"
-        );
-        // A file with no extension -> a web search for "<name> file".
-        assert_eq!(
-            explain_url(Path::new("/x/README"), false),
-            "https://duckduckgo.com/?q=README+file"
-        );
-        // Special characters in the name are percent-encoded.
-        assert_eq!(
-            explain_url(Path::new("/x/my file & stuff"), true),
-            "https://duckduckgo.com/?q=my+file+%26+stuff+folder"
-        );
+    fn selection_plain_shift_toggle() {
+        let mut m = vec![false; 6];
+
+        // Plain click selects only that row and anchors there.
+        let a = apply_selection(&mut m, None, 2, false, false);
+        assert_eq!(a, Some(2));
+        assert_eq!(m, vec![false, false, true, false, false, false]);
+
+        // Shift-click extends a contiguous range from the anchor (2..=4).
+        let a = apply_selection(&mut m, a, 4, true, false);
+        assert_eq!(a, Some(2), "anchor stays put for shift");
+        assert_eq!(m, vec![false, false, true, true, true, false]);
+
+        // Shift the other direction from the same anchor (0..=2).
+        let a = apply_selection(&mut m, a, 0, true, false);
+        assert_eq!(m, vec![true, true, true, false, false, false]);
+
+        // Ctrl/Cmd-click toggles a single row without clearing the rest.
+        let a = apply_selection(&mut m, a, 5, false, true);
+        assert_eq!(a, Some(5));
+        assert_eq!(m, vec![true, true, true, false, false, true]);
+
+        // Toggling an already-selected row clears just it.
+        apply_selection(&mut m, a, 1, false, true);
+        assert_eq!(m, vec![true, false, true, false, false, true]);
+
+        // A plain click collapses back to a single selection.
+        apply_selection(&mut m, Some(5), 3, false, false);
+        assert_eq!(m, vec![false, false, false, true, false, false]);
     }
 }

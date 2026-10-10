@@ -8,6 +8,7 @@
 )]
 
 mod app;
+mod file_info;
 mod license;
 mod license_mgr;
 #[cfg(target_os = "linux")]

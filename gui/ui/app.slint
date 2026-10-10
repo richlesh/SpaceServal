@@ -18,8 +18,8 @@ import { ListView } from "std-widgets.slint";
 
 // The per-volume disk-usage explorer window, opened on a mount double-click.
 // Re-exported so the Rust controller can instantiate it via include_modules!.
-import { VolumeWindow, WedgeInfo } from "volume.slint";
-export { VolumeWindow, WedgeInfo }
+import { VolumeWindow, WedgeInfo, ExplainEntry } from "volume.slint";
+export { VolumeWindow, WedgeInfo, ExplainEntry }
 
 // One mounted volume shown in the main-window list. Populated by the Rust
 // controller from `mounts::list()`; the byte sizes are pre-formatted there.
