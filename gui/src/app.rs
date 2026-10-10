@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slint::{ModelRc, SharedPixelBuffer, SharedString, VecModel};
+use slint::{Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 
 use crate::license_mgr::Settings;
 
@@ -24,6 +24,24 @@ struct Controller {
     theme_before_settings: bool,
     /// Font-size index captured when the Settings dialog opened.
     font_index_before_settings: i32,
+    /// Open disk-usage explorer windows, kept alive while shown. Each entry is
+    /// a `VolumeWindow` and its navigation state.
+    volume_windows: Vec<VolumeHandle>,
+}
+
+/// A live volume-explorer window plus the state its callbacks mutate.
+struct VolumeHandle {
+    /// Held so the window stays open; its callbacks own what they need.
+    #[allow(dead_code)]
+    window: VolumeWindow,
+}
+
+/// Navigation state for one volume-explorer window.
+struct VolState {
+    /// The volume root; the Up button is disabled when `current == root`.
+    root: std::path::PathBuf,
+    /// Directory currently displayed.
+    current: std::path::PathBuf,
 }
 
 pub fn run() -> Result<(), slint::PlatformError> {
@@ -48,6 +66,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         settings,
         theme_before_settings: true,
         font_index_before_settings: 0,
+        volume_windows: Vec::new(),
     }));
 
     // App version + icon for the window and dialogs.
@@ -134,6 +153,15 @@ fn wire_callbacks(window: &MainWindow, ctrl: &Rc<RefCell<Controller>>) {
         move || {
             if let Some(w) = handle.upgrade() {
                 refresh_mounts(&w, ctrl.borrow().settings.show_network_shares);
+            }
+        }
+    });
+    window.on_open_volume({
+        let ctrl = ctrl.clone();
+        let handle = window.as_weak();
+        move |mount_point| {
+            if let Some(w) = handle.upgrade() {
+                open_volume_window(&ctrl, &w, mount_point.as_str());
             }
         }
     });
@@ -452,4 +480,370 @@ fn refresh_mounts(w: &MainWindow, show_network: bool) {
         })
         .collect();
     w.set_mounts(ModelRc::new(VecModel::from(rows)));
+}
+
+// ---------------------------------------------------------------------------
+// Per-volume disk-usage explorer window
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+thread_local! {
+    /// Completed directory scans, keyed by absolute path, so navigating Up and
+    /// back down (or revisiting via the pie) redisplays instantly instead of
+    /// re-walking the disk. UI-thread only: every access happens on the Slint
+    /// event loop, so a `thread_local` needs no locking.
+    static SCAN_CACHE: RefCell<HashMap<std::path::PathBuf, crate::scan::DirScan>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Soft cap on cached directories; beyond this the cache is cleared wholesale
+/// (simple and good enough — the common case is a handful of visited dirs).
+const SCAN_CACHE_MAX: usize = 512;
+
+/// Return a cached scan for `path`, if one was stored.
+fn scan_cache_get(path: &std::path::Path) -> Option<crate::scan::DirScan> {
+    SCAN_CACHE.with(|c| c.borrow().get(path).cloned())
+}
+
+/// Store a completed scan for `path`, clearing the cache first if it grew past
+/// the cap.
+fn scan_cache_put(path: std::path::PathBuf, scan: crate::scan::DirScan) {
+    SCAN_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() >= SCAN_CACHE_MAX {
+            map.clear();
+        }
+        map.insert(path, scan);
+    });
+}
+
+/// Drop every cached scan at or below `root`. Used to force a fresh scan (e.g.
+/// when a volume window is (re)opened) so stale sizes aren't shown.
+fn scan_cache_invalidate_under(root: &std::path::Path) {
+    SCAN_CACHE.with(|c| c.borrow_mut().retain(|p, _| !p.starts_with(root)));
+}
+
+/// Open a new disk-usage explorer window rooted at `mount_point`, perform the
+/// initial scan, wire its navigation callbacks, and keep it alive.
+fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_point: &str) {
+    let Ok(win) = VolumeWindow::new() else {
+        return;
+    };
+    // Inherit the main window's theme + font size + icon.
+    win.set_theme_dark(main.get_theme_dark());
+    win.set_base_font_size(main.get_base_font_size());
+    win.set_window_icon(main.get_window_icon());
+
+    let root = std::path::PathBuf::from(mount_point);
+    let state = Rc::new(RefCell::new(VolState {
+        root: root.clone(),
+        current: root.clone(),
+    }));
+
+    // Drill into the entry at `index` in the current wedge model (legend row or
+    // mapped pie click), if it is a directory.
+    let drill_to = {
+        let state = state.clone();
+        move |w: &VolumeWindow, index: usize| {
+            let wedges = w.get_wedges();
+            let Some(entry) = wedges.row_data(index) else {
+                return;
+            };
+            if !entry.is_dir {
+                return;
+            }
+            state.borrow_mut().current = std::path::PathBuf::from(entry.path.as_str());
+            rescan_volume(w, &state);
+        }
+    };
+    let drill_to = Rc::new(drill_to);
+
+    win.on_drill_in({
+        let drill_to = drill_to.clone();
+        let handle = win.as_weak();
+        move |index| {
+            if let Some(w) = handle.upgrade() {
+                if index >= 0 {
+                    drill_to(&w, index as usize);
+                }
+            }
+        }
+    });
+
+    // Pie click: find the wedge whose span contains `deg`, then drill into it.
+    win.on_drill_at_angle({
+        let drill_to = drill_to.clone();
+        let handle = win.as_weak();
+        move |deg| {
+            if let Some(w) = handle.upgrade() {
+                let wedges = w.get_wedges();
+                let hit = (0..wedges.row_count()).find(|&i| {
+                    let e = wedges.row_data(i).unwrap();
+                    deg >= e.start_deg && deg < e.start_deg + e.sweep_deg
+                });
+                if let Some(i) = hit {
+                    drill_to(&w, i);
+                }
+            }
+        }
+    });
+
+    // Pie hover: set `hovered-name` to the basename of the wedge under the
+    // pointer so the window can show a tooltip.
+    win.on_hover_at_angle({
+        let handle = win.as_weak();
+        move |deg| {
+            if let Some(w) = handle.upgrade() {
+                let wedges = w.get_wedges();
+                let name = (0..wedges.row_count())
+                    .find_map(|i| {
+                        let e = wedges.row_data(i).unwrap();
+                        (deg >= e.start_deg && deg < e.start_deg + e.sweep_deg).then_some(e.name)
+                    })
+                    .unwrap_or_default();
+                w.set_hovered_name(name);
+            }
+        }
+    });
+    win.on_hover_clear({
+        let handle = win.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                w.set_hovered_name(SharedString::new());
+            }
+        }
+    });
+
+    // Go up one level, but never above the volume root.
+    win.on_go_up({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                let next = {
+                    let s = state.borrow();
+                    parent_within_root(&s.current, &s.root)
+                };
+                if let Some(p) = next {
+                    state.borrow_mut().current = p;
+                    rescan_volume(&w, &state);
+                }
+            }
+        }
+    });
+
+    // The volume label: the mount's last path component, or the whole path for
+    // the root "/".
+    let label = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| mount_point.to_string());
+    win.set_volume_name(SharedString::from(label));
+
+    // Start each explorer session fresh: drop any scans cached under this root
+    // from a previous session so on-disk changes are reflected.
+    scan_cache_invalidate_under(&root);
+
+    rescan_volume(&win, &state);
+    let _ = win.show();
+
+    ctrl.borrow_mut().volume_windows.push(VolumeHandle { window: win });
+}
+
+/// Scan `state.current`, recompute wedges, and push them (plus the path and
+/// Up-button state) into the window model. The scan runs on a worker thread so
+/// a large volume never freezes the UI; results are marshaled back to the event
+/// loop. A generation counter guards against a stale scan landing after the
+/// user has already navigated elsewhere.
+fn rescan_volume(win: &VolumeWindow, state: &Rc<RefCell<VolState>>) {
+    let (current, root) = {
+        let s = state.borrow();
+        (s.current.clone(), s.root.clone())
+    };
+
+    // Bump the generation so a slower earlier scan can't overwrite this one.
+    let generation = win.get_scan_generation().wrapping_add(1);
+    win.set_scan_generation(generation);
+
+    // Update the path + Up button and show a "scanning" state immediately.
+    win.set_current_path(SharedString::from(current.to_string_lossy().into_owned()));
+    win.set_can_go_up(current != root);
+
+    // Cache hit: this directory was fully scanned already (e.g. the user went
+    // Up and back down, or revisited via the pie). Render instantly without
+    // touching the disk again.
+    if let Some(scan) = scan_cache_get(&current) {
+        win.set_wedges(wedges_to_model(&crate::scan::wedges(&scan)));
+        win.set_scanning(false);
+        return;
+    }
+
+    win.set_scanning(true);
+    // Clear stale wedges so the pie doesn't show the previous directory.
+    win.set_wedges(ModelRc::new(VecModel::<WedgeInfo>::from(Vec::new())));
+
+    let weak = win.as_weak();
+    std::thread::spawn(move || {
+        // Coalesce rapid progress updates: push at most every ~120ms while the
+        // scan runs, then always push a final snapshot. This keeps a volume
+        // with many directories from flooding the event loop.
+        let mut last_push = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        let mut push = |scan: &crate::scan::DirScan, final_update: bool| {
+            if !final_update && last_push.elapsed() < std::time::Duration::from_millis(120) {
+                return;
+            }
+            last_push = std::time::Instant::now();
+            let wedges = crate::scan::wedges(scan);
+            let weak = weak.clone();
+            // On the final update, carry the completed scan so the UI thread can
+            // cache it for instant redisplay on revisit.
+            let to_cache = final_update.then(|| (current.clone(), scan.clone()));
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(win) = weak.upgrade() {
+                    // Ignore if the user navigated away while we were scanning.
+                    if win.get_scan_generation() != generation {
+                        return;
+                    }
+                    win.set_wedges(wedges_to_model(&wedges));
+                    if final_update {
+                        win.set_scanning(false);
+                        // Runs on the UI thread, so the thread-local cache is
+                        // safe to touch here.
+                        if let Some((path, scan)) = to_cache {
+                            scan_cache_put(path, scan);
+                        }
+                    }
+                }
+            });
+        };
+
+        // Keep the most recent snapshot so the final flush doesn't rescan.
+        let mut latest = crate::scan::DirScan::default();
+        crate::scan::scan_dir_streaming(&current, &mut |snapshot| {
+            latest = snapshot.clone();
+            push(snapshot, false);
+        });
+        // Final flush: guarantees the last update (and scanning=false) lands
+        // even when the throttle skipped the final progress callback.
+        push(&latest, true);
+    });
+}
+
+/// Convert scan wedges into the Slint `WedgeInfo` model consumed by the window.
+fn wedges_to_model(wedges: &[crate::scan::Wedge]) -> ModelRc<WedgeInfo> {
+    let rows: Vec<WedgeInfo> = wedges
+        .iter()
+        .map(|w| WedgeInfo {
+            name: SharedString::from(w.name.clone()),
+            path: SharedString::from(w.path.to_string_lossy().into_owned()),
+            is_dir: w.is_dir,
+            size_text: SharedString::from(w.size_text.clone()),
+            percent_text: SharedString::from(w.percent_text.clone()),
+            commands: SharedString::from(w.commands.clone()),
+            color: slint::Brush::SolidColor(parse_hex_color(&w.color)),
+            start_deg: w.start_deg,
+            sweep_deg: w.sweep_deg,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// The directory to show after pressing Up: `current`'s parent, but never
+/// above `root`. Returns `None` when already at the root (nowhere to go).
+fn parent_within_root(
+    current: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if current == root {
+        return None;
+    }
+    match current.parent() {
+        Some(p) if p.starts_with(root) => Some(p.to_path_buf()),
+        // Parent escapes the volume root (shouldn't happen) — clamp to root.
+        _ => Some(root.to_path_buf()),
+    }
+}
+
+/// Parse a `#rrggbb` string into a Slint color (opaque; falls back to gray).
+fn parse_hex_color(s: &str) -> slint::Color {
+    let hex = s.trim_start_matches('#');
+    if hex.len() == 6 {
+        if let Ok(v) = u32::from_str_radix(hex, 16) {
+            let r = ((v >> 16) & 0xff) as u8;
+            let g = ((v >> 8) & 0xff) as u8;
+            let b = (v & 0xff) as u8;
+            return slint::Color::from_rgb_u8(r, g, b);
+        }
+    }
+    slint::Color::from_rgb_u8(0x80, 0x80, 0x80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parent_within_root, parse_hex_color, scan_cache_get, scan_cache_invalidate_under,
+        scan_cache_put,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn up_stops_at_root() {
+        let root = Path::new("/Volumes/Disk");
+        // At root: nowhere to go.
+        assert_eq!(parent_within_root(root, root), None);
+        // One level down: parent is the root.
+        assert_eq!(
+            parent_within_root(Path::new("/Volumes/Disk/sub"), root),
+            Some(PathBuf::from("/Volumes/Disk"))
+        );
+        // Two levels down: parent is the intermediate dir.
+        assert_eq!(
+            parent_within_root(Path::new("/Volumes/Disk/a/b"), root),
+            Some(PathBuf::from("/Volumes/Disk/a"))
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_handles_valid_and_invalid() {
+        let c = parse_hex_color("#ff8800");
+        assert_eq!((c.red(), c.green(), c.blue()), (0xff, 0x88, 0x00));
+        // No leading '#': still parsed.
+        let c = parse_hex_color("00ff00");
+        assert_eq!((c.red(), c.green(), c.blue()), (0x00, 0xff, 0x00));
+        // Garbage falls back to gray, no panic.
+        let c = parse_hex_color("nope");
+        assert_eq!((c.red(), c.green(), c.blue()), (0x80, 0x80, 0x80));
+    }
+
+    #[test]
+    fn scan_cache_stores_and_invalidates_by_path() {
+        let mk = |total: u64| crate::scan::DirScan {
+            entries: Vec::new(),
+            total_bytes: total,
+        };
+        let a = PathBuf::from("/Volumes/CacheTest/a");
+        let b = PathBuf::from("/Volumes/CacheTest/a/b");
+        let other = PathBuf::from("/Volumes/Elsewhere/x");
+
+        // Miss, then put, then hit.
+        assert!(scan_cache_get(&a).is_none());
+        scan_cache_put(a.clone(), mk(100));
+        scan_cache_put(b.clone(), mk(40));
+        scan_cache_put(other.clone(), mk(7));
+        assert_eq!(scan_cache_get(&a).unwrap().total_bytes, 100);
+        assert_eq!(scan_cache_get(&b).unwrap().total_bytes, 40);
+
+        // Invalidate only the subtree under the test root.
+        scan_cache_invalidate_under(Path::new("/Volumes/CacheTest"));
+        assert!(scan_cache_get(&a).is_none());
+        assert!(scan_cache_get(&b).is_none());
+        // Unrelated entries survive.
+        assert_eq!(scan_cache_get(&other).unwrap().total_bytes, 7);
+
+        // Clean up so other tests on this thread start clean.
+        scan_cache_invalidate_under(Path::new("/Volumes/Elsewhere"));
+    }
 }

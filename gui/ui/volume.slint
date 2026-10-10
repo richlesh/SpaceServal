@@ -1,0 +1,302 @@
+// Per-volume disk-usage explorer window for SpaceServal.
+//
+// Shows a pie chart of the current directory's top-level contents. Each wedge
+// is one immediate child; the legend lists each child's name and size on disk.
+// Double-clicking a directory (a wedge or its legend row) drills into it; the
+// Up button goes back up a level; the current path is shown at the bottom.
+//
+// All geometry (wedge angles, SVG path commands, colors, sizes) is computed by
+// the Rust `scan` module and pushed in as `wedges`. The window reports user
+// intent through callbacks; the controller performs the scan and updates the
+// model.
+
+import { Button, ScrollView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+
+// One pie wedge / legend entry. Mirrors `scan::Wedge` on the Rust side.
+export struct WedgeInfo {
+    name: string,
+    path: string,          // absolute path, used to drill into directories
+    is-dir: bool,
+    size-text: string,     // e.g. "1.20 GB"
+    percent-text: string,  // e.g. "42%"
+    commands: string,      // SVG path commands in a 200x200 viewbox
+    color: brush,          // wedge fill color (built by the controller)
+    start-deg: float,      // wedge start angle, clockwise from 12 o'clock
+    sweep-deg: float,      // wedge angular span
+}
+
+export component VolumeWindow inherits Window {
+    title: "SpaceServal — " + root.volume-name;
+    preferred-width: 760px;
+    preferred-height: 560px;
+    min-width: 520px;
+    min-height: 420px;
+    icon: root.window-icon;
+
+    in property <image> window-icon;
+    in property <bool> theme-dark: true;
+    in property <length> base-font-size: 15px;
+    default-font-size: root.base-font-size;
+
+    // Volume label shown in the title and header.
+    in property <string> volume-name;
+    // Absolute path of the directory currently displayed (bottom label).
+    in property <string> current-path;
+    // Whether we can go up a level (false at the volume root).
+    in property <bool> can-go-up: false;
+    // True while a background scan is running for the current directory.
+    in property <bool> scanning: false;
+    // Monotonic scan id; a finishing background scan whose id no longer matches
+    // is discarded (the user navigated away before it completed). Managed by
+    // the controller.
+    in-out property <int> scan-generation: 0;
+    // Wedges for the current directory (empty ⇒ nothing to show).
+    in property <[WedgeInfo]> wedges: [];
+
+    // User asked to drill into the entry at `index` (double-clicked a wedge or
+    // legend row). The controller ignores it when the entry isn't a directory.
+    callback drill-in(int /* index */);
+    // User double-clicked the pie at `angle-deg` (clockwise from 12 o'clock).
+    // The controller maps the angle to a wedge and drills in if it's a dir.
+    callback drill-at-angle(float /* degrees */);
+    // Pointer moved over the pie at `angle-deg`; the controller resolves the
+    // wedge and sets `hovered-name` to that entry's basename.
+    callback hover-at-angle(float /* degrees */);
+    // Pointer left the pie; clear any hover label.
+    callback hover-clear();
+    // Basename of the entry currently under the pointer ("" when none).
+    in property <string> hovered-name: "";
+    // Drives the "Working…" fade: toggled by a timer while scanning so the
+    // animated opacity ping-pongs between dim and bright.
+    property <bool> working-bright: false;
+    // User asked to go up one directory level.
+    callback go-up();
+
+    // Local theme colors (kept independent of the main window's Theme global so
+    // this file can be imported without a cycle).
+    property <bool> dark: root.theme-dark;
+    property <brush> text: Palette.foreground;
+    property <brush> muted: dark ? #9a9a9a : #666666;
+    property <brush> card: dark ? #262626 : #f4f4f4;
+    property <brush> hairline: dark ? #4a4a4a : #cccccc;
+    property <brush> hover: dark ? #ffffff14 : #00000010;
+
+    background: Palette.background;
+
+    init => {
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    changed theme-dark => {
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    // Toggle the Working brightness on a cadence while scanning; the Text's
+    // `animate opacity` turns each flip into a smooth fade in/out.
+    working-timer := Timer {
+        interval: 700ms;
+        running: root.scanning;
+        triggered => { root.working-bright = !root.working-bright; }
+    }
+    // Reset to dim whenever a scan ends so the next scan starts from a fade-in.
+    changed scanning => {
+        if (!root.scanning) {
+            root.working-bright = false;
+        }
+    }
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        // Header: Up button + volume name.
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Button {
+                text: "↑ Up";
+                enabled: root.can-go-up;
+                clicked => { root.go-up(); }
+            }
+            Text {
+                text: root.volume-name;
+                font-size: 20px;
+                font-weight: 700;
+                color: root.text;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            // Animated "Working…" shown while a scan is still expanding
+            // directories. A timer flips `working-bright` on a cadence and the
+            // opacity animates between dim and bright, so it fades in and out
+            // continuously until `scanning` turns false.
+            Text {
+                text: "Working…";
+                color: root.muted;
+                font-italic: true;
+                vertical-alignment: center;
+                visible: root.scanning;
+                opacity: root.working-bright ? 1.0 : 0.15;
+                animate opacity { duration: 650ms; easing: ease-in-out; }
+            }
+        }
+
+        // Body: pie on the left, scrollable legend on the right.
+        HorizontalBox {
+            padding: 0px;
+            spacing: 16px;
+            vertical-stretch: 1;
+
+            // ---- Pie chart --------------------------------------------------
+            Rectangle {
+                width: 300px;
+                horizontal-stretch: 0;
+
+                pie := Rectangle {
+                    width: min(parent.width, parent.height) - 16px;
+                    height: self.width;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+
+                    for w[i] in root.wedges: Path {
+                        width: 100%;
+                        height: 100%;
+                        viewbox-width: 200;
+                        viewbox-height: 200;
+                        commands: w.commands;
+                        fill: w.color;
+                        stroke: root.card;
+                        stroke-width: 1px;
+                    }
+
+                    // Double-click to drill in: map the pointer position to an
+                    // angle (clockwise from 12 o'clock) and pick the wedge whose
+                    // span contains it.
+                    pie-touch := TouchArea {
+                        double-clicked => {
+                            // Angle clockwise from 12 o'clock of the vector from
+                            // the pie center to the pointer; Rust maps it to a
+                            // wedge. atan2(x, -y) puts 0° at the top; dividing an
+                            // angle by 1deg yields the value in degrees.
+                            root.drill-at-angle(Math.mod(
+                                Math.atan2((self.mouse-x - pie.width / 2) / 1px,
+                                           -(self.mouse-y - pie.height / 2) / 1px)
+                                    / 1deg + 360, 360));
+                        }
+                        // Hover: report the pointer angle so the controller can
+                        // set `hovered-name` to the wedge's basename.
+                        moved => {
+                            root.hover-at-angle(Math.mod(
+                                Math.atan2((self.mouse-x - pie.width / 2) / 1px,
+                                           -(self.mouse-y - pie.height / 2) / 1px)
+                                    / 1deg + 360, 360));
+                        }
+                        changed has-hover => {
+                            if (!self.has-hover) {
+                                root.hover-clear();
+                            }
+                        }
+                    }
+
+                    // Hover tooltip: the basename of the wedge under the cursor,
+                    // floating just below-right of the pointer.
+                    if root.hovered-name != "": Rectangle {
+                        x: min(pie-touch.mouse-x + 12px, pie.width - self.width);
+                        y: min(pie-touch.mouse-y + 12px, pie.height - self.height);
+                        width: tip-text.preferred-width + 16px;
+                        height: tip-text.preferred-height + 10px;
+                        background: root.dark ? #000000d0 : #ffffffe0;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.hairline;
+                        tip-text := Text {
+                            text: root.hovered-name;
+                            color: root.text;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                if root.wedges.length == 0: Text {
+                    text: root.scanning ? "Scanning…" : "Empty or unreadable";
+                    color: root.muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ---- Legend -----------------------------------------------------
+            Rectangle {
+                horizontal-stretch: 1;
+                background: root.card;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: root.hairline;
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 2px;
+                        for w[i] in root.wedges: Rectangle {
+                            height: legend-row.preferred-height + 8px;
+                            background: legend-touch.has-hover ? root.hover : transparent;
+                            legend-touch := TouchArea {
+                                mouse-cursor: w.is-dir ? pointer : default;
+                                double-clicked => { root.drill-in(i); }
+                            }
+                            legend-row := HorizontalBox {
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+                                spacing: 8px;
+                                // Color swatch.
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 3px;
+                                    background: w.color;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                VerticalLayout {
+                                    spacing: 1px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: w.name + (w.is-dir ? "/" : "");
+                                        color: root.text;
+                                        font-weight: w.is-dir ? 700 : 400;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: w.size-text + "  •  " + w.percent-text;
+                                        color: root.muted;
+                                        font-size: root.base-font-size - 2px;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Current path at the bottom.
+        Rectangle {
+            height: path-text.preferred-height + 12px;
+            background: root.card;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: root.hairline;
+            path-text := Text {
+                text: root.current-path;
+                color: root.muted;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+                x: 10px;
+                width: parent.width - 20px;
+                overflow: elide;
+            }
+        }
+    }
+}

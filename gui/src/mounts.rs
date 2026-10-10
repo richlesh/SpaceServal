@@ -72,6 +72,11 @@ pub fn list(include_network: bool) -> Vec<Mount> {
             }
         })
         .collect();
+    // macOS presents the APFS system (`/`, read-only) and Data
+    // (`/System/Volumes/Data`, writable) volumes as one logical disk via
+    // firmlinks; Finder shows a single "Macintosh HD". sysinfo lists both with
+    // identical capacity, so drop the Data half and keep `/`.
+    mounts.retain(|m| !is_hidden_system_volume(&m.mount_point));
     // sysinfo silently omits some removable volumes on macOS (external disks
     // behind certain USB/Thunderbolt bridges, SD readers, drives mounted
     // read-only, …). Removable mounts are always shown, so recover any the OS
@@ -100,6 +105,20 @@ pub fn list(include_network: bool) -> Vec<Mount> {
 /// mounts always do, everything else only if it isn't a network share.
 fn keep_without_network(m: &Mount) -> bool {
     m.removable || !m.network
+}
+
+/// macOS: the writable APFS Data volume is firmlinked under `/` and shown by
+/// Finder as part of the single "Macintosh HD", so hide it (and anything
+/// mounted beneath it, e.g. the `/System/Volumes/Data/home` automount) to avoid
+/// a duplicate of `/`. Other platforms hide nothing here.
+#[cfg(target_os = "macos")]
+fn is_hidden_system_volume(mount_point: &str) -> bool {
+    mount_point == "/System/Volumes/Data" || mount_point.starts_with("/System/Volumes/Data/")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_hidden_system_volume(_mount_point: &str) -> bool {
+    false
 }
 
 /// Removable local volumes that sysinfo may have omitted. Only macOS adds any;
@@ -587,6 +606,27 @@ mod tests {
                 m.mount_point.starts_with("/Volumes/"),
                 "unexpected removable mount point: {}",
                 m.mount_point
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hides_data_volume_but_keeps_root() {
+        assert!(is_hidden_system_volume("/System/Volumes/Data"));
+        assert!(is_hidden_system_volume("/System/Volumes/Data/home"));
+        assert!(!is_hidden_system_volume("/"));
+        assert!(!is_hidden_system_volume("/Volumes/External"));
+
+        for include_network in [false, true] {
+            let listed = list(include_network);
+            assert!(
+                listed.iter().any(|m| m.mount_point == "/"),
+                "root volume should always be listed"
+            );
+            assert!(
+                !listed.iter().any(|m| m.mount_point == "/System/Volumes/Data"),
+                "the firmlinked Data volume should be hidden"
             );
         }
     }

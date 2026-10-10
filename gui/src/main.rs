@@ -17,6 +17,7 @@ mod macos_theme;
 #[cfg(target_os = "macos")]
 mod menu_macos;
 mod mounts;
+mod scan;
 mod sys_colors;
 #[cfg(target_os = "windows")]
 mod win_theme;

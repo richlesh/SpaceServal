@@ -16,6 +16,11 @@ import {
 } from "std-widgets.slint";
 import { ListView } from "std-widgets.slint";
 
+// The per-volume disk-usage explorer window, opened on a mount double-click.
+// Re-exported so the Rust controller can instantiate it via include_modules!.
+import { VolumeWindow, WedgeInfo } from "volume.slint";
+export { VolumeWindow, WedgeInfo }
+
 // One mounted volume shown in the main-window list. Populated by the Rust
 // controller from `mounts::list()`; the byte sizes are pre-formatted there.
 export struct MountInfo {
@@ -211,6 +216,9 @@ export component MainWindow inherits Window {
     // controller; `refresh-mounts` asks it to re-enumerate.
     in property <[MountInfo]> mounts: [];
     callback refresh-mounts();
+    // User double-clicked a volume row; opens the disk-usage explorer window
+    // for the given mount point.
+    callback open-volume(string /* mount-point */);
 
     // True on platforms that use the Slint declarative menu bar (Windows and
     // Linux). On macOS the native menu bar is built directly with muda from the
@@ -309,7 +317,6 @@ export component MainWindow inherits Window {
     VerticalBox {
         padding: 16px;
         spacing: 12px;
-        alignment: start;
 
         HorizontalBox {
             alignment: center;
@@ -347,10 +354,14 @@ export component MainWindow inherits Window {
 
         ListView {
             vertical-stretch: 1;
+            min-height: 120px;
             for m in root.mounts: Rectangle {
                 height: row.preferred-height + 12px;
                 background: touch.has-hover ? Theme.hover-row : transparent;
-                touch := TouchArea { }
+                touch := TouchArea {
+                    mouse-cursor: pointer;
+                    double-clicked => { root.open-volume(m.mount-point); }
+                }
                 row := HorizontalBox {
                     padding-left: 8px;
                     padding-right: 8px;
