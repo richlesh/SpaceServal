@@ -14,6 +14,12 @@ use std::path::{Path, PathBuf};
 /// wedge radius is `PIE/2`. The Slint `Path` scales this to the on-screen size.
 pub const PIE: f32 = 200.0;
 
+/// Maximum number of individual wedges drawn. Beyond this, the smallest entries
+/// are grouped into a single "Other" slice. Keeps very large directories (e.g.
+/// WinSxS, with thousands of entries) from rendering as a mass of sub-pixel,
+/// border-only slivers and from emitting thousands of `Path` elements.
+pub const MAX_WEDGES: usize = 60;
+
 /// One immediate child of the scanned directory.
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -290,25 +296,56 @@ pub fn wedges(scan: &DirScan) -> Vec<Wedge> {
     if total == 0 || scan.entries.is_empty() {
         return Vec::new();
     }
-    let n = scan.entries.len();
-    let mut out = Vec::with_capacity(n);
+    // Entries are sorted largest-first. Render at most `MAX_WEDGES` individual
+    // slices and roll the remaining long tail into a single "Other" slice, so a
+    // directory with thousands of tiny files (e.g. WinSxS) doesn't become a
+    // mass of sub-pixel, border-only slivers (and we don't emit thousands of
+    // Path elements). The combined slices are colored for `slice_count` so the
+    // hue spread stays even.
+    let shown = scan.entries.len().min(MAX_WEDGES);
+    let tail = &scan.entries[shown..];
+    let tail_bytes: u64 = tail
+        .iter()
+        .map(|e| e.size_bytes)
+        .fold(0, u64::saturating_add);
+    let has_other = !tail.is_empty() && tail_bytes > 0;
+    let slice_count = shown + usize::from(has_other);
+
+    let mut out = Vec::with_capacity(slice_count);
     let mut cursor = 0.0f32;
-    for (i, e) in scan.entries.iter().enumerate() {
-        let frac = e.size_bytes as f64 / total as f64;
-        let sweep = (frac * 360.0) as f32;
-        let percent = (frac * 100.0).round() as i64;
+    let pct = |bytes: u64| (bytes as f64 / total as f64 * 100.0).round() as i64;
+    let sweep_of = |bytes: u64| (bytes as f64 / total as f64 * 360.0) as f32;
+
+    for (i, e) in scan.entries.iter().take(shown).enumerate() {
+        let sweep = sweep_of(e.size_bytes);
         out.push(Wedge {
             name: e.name.clone(),
             path: e.path.clone(),
             is_dir: e.is_dir,
             size_text: crate::mounts::format_bytes(e.size_bytes),
-            percent_text: format!("{percent}%"),
+            percent_text: format!("{}%", pct(e.size_bytes)),
             commands: wedge_commands(cursor, sweep),
-            color: wedge_color(i, n),
+            color: wedge_color(i, slice_count),
             start_deg: cursor,
             sweep_deg: sweep,
         });
         cursor += sweep;
+    }
+
+    if has_other {
+        // Fill the remaining angle exactly, avoiding rounding gaps.
+        let sweep = (360.0 - cursor).max(0.0);
+        out.push(Wedge {
+            name: format!("Other ({} items)", tail.len()),
+            path: std::path::PathBuf::new(),
+            is_dir: false,
+            size_text: crate::mounts::format_bytes(tail_bytes),
+            percent_text: format!("{}%", pct(tail_bytes)),
+            commands: wedge_commands(cursor, sweep),
+            color: wedge_color(slice_count - 1, slice_count),
+            start_deg: cursor,
+            sweep_deg: sweep,
+        });
     }
     out
 }
@@ -446,6 +483,63 @@ mod tests {
     #[test]
     fn empty_scan_has_no_wedges() {
         assert!(wedges(&DirScan::default()).is_empty());
+    }
+
+    #[test]
+    fn many_entries_group_into_other() {
+        // More entries than MAX_WEDGES: expect MAX_WEDGES slices plus one
+        // "Other" slice, together spanning the full circle with no gap.
+        let count = MAX_WEDGES + 500;
+        let entries: Vec<Entry> = (0..count)
+            .map(|k| Entry {
+                name: format!("e{k}"),
+                path: format!("/e{k}").into(),
+                is_dir: false,
+                // Strictly decreasing so sort order is stable and the tail is
+                // the smallest items.
+                size_bytes: (count - k) as u64,
+            })
+            .collect();
+        let total = entries.iter().map(|e| e.size_bytes).sum();
+        let scan = DirScan {
+            entries,
+            total_bytes: total,
+        };
+
+        let ws = wedges(&scan);
+        assert_eq!(ws.len(), MAX_WEDGES + 1, "capped slices + one Other");
+        let other = ws.last().unwrap();
+        assert!(other.name.starts_with("Other ("), "last slice is Other");
+        assert!(!other.is_dir, "Other is not drillable");
+        assert_eq!(other.path.as_os_str().len(), 0, "Other has no path");
+        // Slices tile the full circle without a visible gap.
+        let sum: f32 = ws.iter().map(|w| w.sweep_deg).sum();
+        assert!(
+            (sum - 360.0).abs() < 0.5,
+            "slices should tile 360°, got {sum}"
+        );
+        // "Other" accounts for the 500 smallest items.
+        assert!(other.name.contains("500"));
+    }
+
+    #[test]
+    fn few_entries_are_not_grouped() {
+        // At or below the cap, every entry is its own wedge (no "Other").
+        let entries: Vec<Entry> = (0..5)
+            .map(|k| Entry {
+                name: format!("e{k}"),
+                path: format!("/e{k}").into(),
+                is_dir: true,
+                size_bytes: 10 + k as u64,
+            })
+            .collect();
+        let total = entries.iter().map(|e| e.size_bytes).sum();
+        let ws = wedges(&DirScan {
+            entries,
+            total_bytes: total,
+        });
+        assert_eq!(ws.len(), 5);
+        assert!(ws.iter().all(|w| !w.name.starts_with("Other (")));
     }
 
     #[test]

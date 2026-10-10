@@ -162,8 +162,12 @@ export component VolumeWindow inherits Window {
                         viewbox-height: 200;
                         commands: w.commands;
                         fill: w.color;
+                        // Hairline separator. Kept thin so narrow wedges still
+                        // show their fill instead of being swallowed by the
+                        // border (the long tail is also grouped into "Other",
+                        // so wedges never get sub-pixel thin).
                         stroke: root.card;
-                        stroke-width: 1px;
+                        stroke-width: 0.5px;
                     }
 
                     // Double-click to drill in: map the pointer position to an
