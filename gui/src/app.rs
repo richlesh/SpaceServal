@@ -629,6 +629,50 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
         }
     });
 
+    // "What is this File…": open a reference lookup for the entry in the
+    // browser. We don't scrape a third-party API — opening the user's browser
+    // to an authoritative page (or a search) is robust and ToS-safe.
+    win.on_explain_item({
+        let handle = win.as_weak();
+        move |index| {
+            if let Some(w) = handle.upgrade() {
+                if let Some(e) = entry_at(&w, index) {
+                    let _ = webbrowser_open(&explain_url(&e.0, e.1));
+                }
+            }
+        }
+    });
+
+    // "Delete Immediately…": permanently remove the entry (no trash, no undo),
+    // then re-scan the current directory so the chart reflects the change.
+    win.on_delete_item({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move |index| {
+            if let Some(w) = handle.upgrade() {
+                if let Some((path, is_dir)) = entry_at(&w, index) {
+                    let result = if is_dir {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    match result {
+                        Ok(()) => {
+                            // The directory contents changed; drop cached scans
+                            // for it and re-scan so sizes/wedges update.
+                            let current = state.borrow().current.clone();
+                            scan_cache_invalidate_under(&current);
+                            rescan_volume(&w, &state);
+                        }
+                        Err(e) => {
+                            tracing::warn!("delete failed for {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // The volume label: the mount's last path component, or the whole path for
     // the root "/".
     let label = root
@@ -765,6 +809,62 @@ fn parent_within_root(
     }
 }
 
+/// The entry (absolute path, is-dir) at `index` in the window's current wedge
+/// model, or `None` for an out-of-range index or the synthetic "Other" row
+/// (which has an empty path and must not be explained or deleted).
+fn entry_at(w: &VolumeWindow, index: i32) -> Option<(std::path::PathBuf, bool)> {
+    if index < 0 {
+        return None;
+    }
+    let row = w.get_wedges().row_data(index as usize)?;
+    if row.path.is_empty() {
+        return None;
+    }
+    Some((std::path::PathBuf::from(row.path.as_str()), row.is_dir))
+}
+
+/// A browser URL that explains what a file/directory is. For a directory we
+/// just search for the name; for a file we look its extension up on fileinfo's
+/// extension reference, falling back to a web search when there's no extension.
+fn explain_url(path: &std::path::Path, is_dir: bool) -> String {
+    let encode = |s: &str| {
+        // Minimal percent-encoding for a query string.
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if is_dir {
+        return format!(
+            "https://duckduckgo.com/?q={}",
+            encode(&format!("{name} folder"))
+        );
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) if !ext.is_empty() => {
+            format!(
+                "https://fileinfo.com/extension/{}",
+                encode(&ext.to_lowercase())
+            )
+        }
+        _ => format!(
+            "https://duckduckgo.com/?q={}",
+            encode(&format!("{name} file"))
+        ),
+    }
+}
+
 /// Parse a `#rrggbb` string into a Slint color (opaque; falls back to gray).
 fn parse_hex_color(s: &str) -> slint::Color {
     let hex = s.trim_start_matches('#');
@@ -782,8 +882,8 @@ fn parse_hex_color(s: &str) -> slint::Color {
 #[cfg(test)]
 mod tests {
     use super::{
-        parent_within_root, parse_hex_color, scan_cache_get, scan_cache_invalidate_under,
-        scan_cache_put,
+        explain_url, parent_within_root, parse_hex_color, scan_cache_get,
+        scan_cache_invalidate_under, scan_cache_put,
     };
     use std::path::{Path, PathBuf};
 
@@ -843,5 +943,29 @@ mod tests {
 
         // Clean up so other tests on this thread start clean.
         scan_cache_invalidate_under(Path::new("/Volumes/Elsewhere"));
+    }
+
+    #[test]
+    fn explain_url_by_kind_and_extension() {
+        // A file with an extension -> fileinfo extension reference (lowercased).
+        assert_eq!(
+            explain_url(Path::new("/x/Report.PDF"), false),
+            "https://fileinfo.com/extension/pdf"
+        );
+        // A directory -> a web search for "<name> folder".
+        assert_eq!(
+            explain_url(Path::new("/x/Caches"), true),
+            "https://duckduckgo.com/?q=Caches+folder"
+        );
+        // A file with no extension -> a web search for "<name> file".
+        assert_eq!(
+            explain_url(Path::new("/x/README"), false),
+            "https://duckduckgo.com/?q=README+file"
+        );
+        // Special characters in the name are percent-encoded.
+        assert_eq!(
+            explain_url(Path::new("/x/my file & stuff"), true),
+            "https://duckduckgo.com/?q=my+file+%26+stuff+folder"
+        );
     }
 }

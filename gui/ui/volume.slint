@@ -71,6 +71,11 @@ export component VolumeWindow inherits Window {
     property <bool> working-bright: false;
     // User asked to go up one directory level.
     callback go-up();
+    // Right-click menu actions on a legend entry (by index): look up what the
+    // file/dir is, and delete it immediately. The controller ignores the
+    // synthetic "Other" grouping row.
+    callback explain-item(int /* index */);
+    callback delete-item(int /* index */);
 
     // Local theme colors (kept independent of the main window's Theme global so
     // this file can be imported without a cycle).
@@ -257,39 +262,56 @@ export component VolumeWindow inherits Window {
                         padding: 8px;
                         spacing: 2px;
                         for w[i] in root.wedges: Rectangle {
-                            height: legend-row.preferred-height + 8px;
+                            // Fixed row height (two text lines + padding) so the
+                            // height doesn't depend on a child that fills it.
+                            height: root.base-font-size * 2 + 16px;
                             background: legend-touch.has-hover ? root.hover : transparent;
-                            legend-touch := TouchArea {
-                                mouse-cursor: w.is-dir ? pointer : default;
-                                double-clicked => { root.drill-in(i); }
-                            }
-                            legend-row := HorizontalBox {
-                                padding-left: 6px;
-                                padding-right: 6px;
-                                padding-top: 4px;
-                                padding-bottom: 4px;
-                                spacing: 8px;
-                                // Color swatch.
-                                Rectangle {
-                                    width: 14px;
-                                    height: 14px;
-                                    border-radius: 3px;
-                                    background: w.color;
-                                    y: (parent.height - self.height) / 2;
-                                }
-                                VerticalLayout {
-                                    spacing: 1px;
-                                    horizontal-stretch: 1;
-                                    Text {
-                                        text: w.name + (w.is-dir ? "/" : "");
-                                        color: root.text;
-                                        font-weight: w.is-dir ? 700 : 400;
-                                        overflow: elide;
+                            // Right-click menu for real entries (not the
+                            // synthetic "Other" grouping row, which has no path).
+                            ContextMenuArea {
+                                enabled: w.path != "";
+                                Menu {
+                                    MenuItem {
+                                        title: "What is this File…";
+                                        activated => { root.explain-item(i); }
                                     }
-                                    Text {
-                                        text: w.size-text + "  •  " + w.percent-text;
-                                        color: root.muted;
-                                        font-size: root.base-font-size - 2px;
+                                    MenuItem {
+                                        title: "Delete Immediately…";
+                                        activated => { root.delete-item(i); }
+                                    }
+                                }
+                                legend-touch := TouchArea {
+                                    mouse-cursor: w.is-dir ? pointer : default;
+                                    double-clicked => { root.drill-in(i); }
+                                }
+                                legend-row := HorizontalBox {
+                                    padding-left: 6px;
+                                    padding-right: 6px;
+                                    padding-top: 4px;
+                                    padding-bottom: 4px;
+                                    spacing: 8px;
+                                    // Color swatch.
+                                    Rectangle {
+                                        width: 14px;
+                                        height: 14px;
+                                        border-radius: 3px;
+                                        background: w.color;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                    VerticalLayout {
+                                        spacing: 1px;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: w.name + (w.is-dir ? "/" : "");
+                                            color: root.text;
+                                            font-weight: w.is-dir ? 700 : 400;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: w.size-text + "  •  " + w.percent-text;
+                                            color: root.muted;
+                                            font-size: root.base-font-size - 2px;
+                                        }
                                     }
                                 }
                             }
