@@ -2,10 +2,32 @@
 
 A cross-platform desktop application built in Rust with [Slint](https://slint.dev/).
 
-SpaceServal is modeled after the Glowing Cat Software app template: it ships the
-shared chrome and dialogs (About, startup Splash / donation nag, License Key,
-and Settings) along with the licensing, theming, and packaging machinery. The
-main-window application logic is intentionally left as a shell to be filled in.
+SpaceServal is a disk-usage visualizer, built on the Glowing Cat Software app
+template: it ships the shared chrome and dialogs (About, startup Splash /
+donation nag, License Key, and Settings) along with the licensing, theming, and
+packaging machinery. The main window lists mounted volumes and opens a
+per-volume explorer that charts where space is used.
+
+## Features
+
+- **Mounted volumes list** — every mounted drive / mount point with its label,
+  file system, capacity, and a usage bar. Removable drives are always shown;
+  network shares (SMB/NFS/AFP/…) appear when "Show Network Shares" is enabled.
+  On macOS, removable volumes that `sysinfo` misses are recovered via
+  `getfsstat`, and the firmlinked `/System/Volumes/Data` duplicate of `/` is
+  hidden to match Finder.
+- **Disk-usage explorer** — double-click a volume to open a window with a pie
+  chart of the current directory's top-level contents. Each wedge / legend row
+  shows the entry's name and size on disk; the current path and an **Up** button
+  sit at the bottom. Double-click a directory wedge (or its legend row) to drill
+  in.
+  - **Streaming**: items appear as each size is computed, with an animated
+    "Working…" indicator while a scan runs.
+  - **Parallel**: subdirectory sizes are computed across a bounded worker pool.
+  - **Cached**: completed scans are reused, so Up / revisits are instant.
+  - **Hover** a wedge to see the entry's basename.
+- **Theming** that follows the OS light/dark setting and accent color, with a
+  selectable font size.
 
 ## Workspace layout
 
@@ -18,9 +40,13 @@ SpaceServal/
 │   ├── build.rs          # compiles ui/app.slint; Windows icon/version resource
 │   ├── app_icon.rc       # Windows icon resource script
 │   ├── ui/app.slint      # Theme, dialogs (About/Splash/License/Settings), window
+│   ├── ui/volume.slint   # Disk-usage explorer window (pie chart + legend)
 │   └── src/
 │       ├── main.rs
 │       ├── app.rs         # controller: wires dialogs, theme, fonts, splash
+│       ├── mounts.rs      # enumerate drives / mount points + network shares
+│       ├── scan.rs        # directory scanner + pie-wedge geometry
+│       ├── menu_macos.rs  # native macOS menu bar (muda)
 │       ├── license.rs     # HMAC salt (git-ignored secret)
 │       ├── license_mgr.rs # license validation + persisted Settings
 │       ├── sys_colors.rs  # cross-platform OS accent/font-size reader
