@@ -56,10 +56,126 @@ fn size_on_disk(meta: &std::fs::Metadata) -> u64 {
     }
 }
 
+/// Identifies the volume a path lives on, used to detect mount-point crossings
+/// so a scan of one volume doesn't descend into another mounted underneath it.
+///
+/// On macOS the kernel firmlinks the read-only System volume (`/`) and the
+/// writable Data volume (`/System/Volumes/Data`) into one namespace, so the
+/// Data volume's contents appear under `/` as `/Users`, `/Applications`, etc.
+/// `stat`'s `st_dev` reports the *same* device for both halves, so it can't
+/// tell them apart — walking `/` would then double-count the whole Data volume
+/// on top of the System volume. `statfs` *does* distinguish them (its `f_fsid`
+/// / mount-on name differ), so on macOS we identify the volume via `statfs`.
+///
+/// On other Unix platforms there's no firmlink quirk and `st_dev` is correct
+/// (and free — we already stat'd the entry). `None` means the platform doesn't
+/// expose an id, which disables the boundary check (a no-op).
+type VolumeId = u64;
+
+/// The volume id of a path. See [`VolumeId`] for why macOS needs `statfs`
+/// rather than the cheaper `st_dev` from an already-fetched `Metadata`.
+///
+/// macOS firmlinks the read-only System volume (`/`) and the writable Data
+/// volume (`/System/Volumes/Data`) into a single user-visible disk ("Macintosh
+/// HD"): the Data volume's contents surface under `/` as `/Users`,
+/// `/Applications`, etc. We treat that pair as *one* logical volume so a scan
+/// of `/` walks into `/Users` and friends (showing the whole disk, like
+/// Finder) — but we still never cross into other volumes (external `/Volumes/*`
+/// disks, network shares, other APFS volumes), which keep distinct ids. The
+/// volume is identified by its mount-on name (`f_mntonname`), with the Data
+/// volume mapped onto `/` so the two halves share an id.
+#[cfg(target_os = "macos")]
+fn volume_id_of_path(path: &Path, _meta: &std::fs::Metadata) -> Option<VolumeId> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `st` is a plain C struct filled in by statfs on success; `c` is
+    // a valid NUL-terminated path.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
+    let on = on.to_bytes();
+    // Fold the firmlinked Data volume onto the root so System + Data read as a
+    // single logical volume; every other mount keeps its own mount-on name.
+    let canonical: &[u8] = if on == b"/System/Volumes/Data" {
+        b"/"
+    } else {
+        on
+    };
+    Some(hash_bytes(canonical))
+}
+
+/// FNV-1a hash of a byte slice, used to fold a volume's mount-on name into a
+/// `VolumeId`. Collisions across the handful of mounted volumes are vanishingly
+/// unlikely and would at worst miss one boundary, never corrupt data.
+#[cfg(target_os = "macos")]
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Non-macOS Unix: `st_dev` from the metadata we already fetched is correct and
+/// free (no extra syscall).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn volume_id_of_path(_path: &Path, meta: &std::fs::Metadata) -> Option<VolumeId> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.dev())
+}
+
+/// Platforms without a volume id: boundary check disabled.
+#[cfg(not(unix))]
+fn volume_id_of_path(_path: &Path, _meta: &std::fs::Metadata) -> Option<VolumeId> {
+    None
+}
+
+/// Whether `path`/`meta` live on the same volume as `root_vol`. When `root_vol`
+/// is `None` (platform without volume ids) everything is treated as same
+/// volume, so the mount-boundary check is disabled and behavior is unchanged.
+fn same_volume(root_vol: Option<VolumeId>, path: &Path, meta: &std::fs::Metadata) -> bool {
+    match (root_vol, volume_id_of_path(path, meta)) {
+        (Some(root), Some(id)) => root == id,
+        _ => true,
+    }
+}
+
+/// macOS: paths that back the firmlinked disk and must not be walked directly,
+/// because their browsable contents are already surfaced under `/` via
+/// firmlinks (e.g. the Data volume's files appear as `/Users`, `/opt`, …).
+/// Walking `/System/Volumes/Data` as well would count the entire Data volume a
+/// second time. The sibling `/System/Volumes/{VM,Preboot,Update,…}` mounts are
+/// hidden system volumes Finder doesn't show, so skip them too. These are
+/// reached by descending into `/System` → `/System/Volumes`.
+#[cfg(target_os = "macos")]
+fn is_firmlink_backing_path(path: &Path) -> bool {
+    path.starts_with("/System/Volumes")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_firmlink_backing_path(_path: &Path) -> bool {
+    false
+}
+
+/// Whether the scanner should descend into the directory at `child`: it must be
+/// on the same (logical) volume as `root_vol` and not a macOS firmlink-backing
+/// mount whose contents are already counted via firmlinks.
+fn should_descend(root_vol: Option<VolumeId>, child: &Path, meta: &std::fs::Metadata) -> bool {
+    same_volume(root_vol, child, meta) && !is_firmlink_backing_path(child)
+}
+
 /// Recursively total the size on disk of everything under `path`, following no
-/// symlinks (so we never double-count or escape the tree). Unreadable entries
-/// are skipped rather than failing the whole scan.
-fn dir_size(path: &Path) -> u64 {
+/// symlinks (so we never double-count or escape the tree) and never crossing a
+/// volume boundary: a child directory on a different volume than `root_vol` is
+/// counted as its own inode but not descended into. Unreadable entries are
+/// skipped rather than failing the whole scan.
+///
+/// `root_vol` is the volume id of the directory being scanned (`None` on
+/// platforms that don't expose it, which disables the boundary check).
+fn dir_size(path: &Path, root_vol: Option<VolumeId>) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -73,12 +189,19 @@ fn dir_size(path: &Path) -> u64 {
                 continue;
             };
             if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
+                // A directory's own inode occupies space regardless of whether
+                // we descend into it.
                 total = total.saturating_add(size_on_disk(&meta));
-            }
-            // A directory's own inode also occupies space; include it.
-            if meta.is_dir() {
+                // Only recurse while staying on the same logical volume and not
+                // into a macOS firmlink-backing mount (whose contents are
+                // already counted via firmlinks). A directory on another volume
+                // is a separate mount point; its contents are that volume's
+                // usage, not ours.
+                let child = entry.path();
+                if should_descend(root_vol, &child, &meta) {
+                    stack.push(child);
+                }
+            } else {
                 total = total.saturating_add(size_on_disk(&meta));
             }
         }
@@ -111,6 +234,15 @@ pub fn scan_dir_streaming(dir: &Path, progress: &mut dyn FnMut(&DirScan)) {
         return;
     };
 
+    // The volume the scanned directory lives on. Child directories on a
+    // different volume are mount points (or, on macOS, firmlinks into the Data
+    // volume); we list them but don't recurse into them, so a scan of `/`
+    // doesn't absorb `/Volumes/*` or the firmlinked `/Users`, `/Applications`,
+    // … (macOS), or `/mnt`, `/media`, and home-dir mounts (Linux).
+    let root_vol = std::fs::metadata(dir)
+        .ok()
+        .and_then(|m| volume_id_of_path(dir, &m));
+
     // First pass: enumerate immediate children and seed each with its own inode
     // allocation. Files are already at their final size; directories will grow.
     let mut entries: Vec<Entry> = Vec::new();
@@ -121,7 +253,11 @@ pub fn scan_dir_streaming(dir: &Path, progress: &mut dyn FnMut(&DirScan)) {
             continue;
         };
         let is_dir = meta.is_dir();
-        if is_dir {
+        // Only directories we should descend into get their contents summed: on
+        // our own logical volume and not a macOS firmlink-backing mount. A
+        // directory we don't descend into (another volume's mount point, or the
+        // Data-volume backing path) stays in the list at its own inode size.
+        if is_dir && should_descend(root_vol, &path, &meta) {
             dir_indices.push(entries.len());
         }
         entries.push(Entry {
@@ -173,7 +309,7 @@ pub fn scan_dir_streaming(dir: &Path, progress: &mut dyn FnMut(&DirScan)) {
                 let Some((index, path)) = job else {
                     break;
                 };
-                let size = dir_size(&path);
+                let size = dir_size(&path, root_vol);
                 // The receiver may be gone if the caller stopped early; ignore.
                 if tx.send((index, size)).is_err() {
                     break;
@@ -243,12 +379,13 @@ fn point_on_circle(deg: f32, radius: f32) -> (f32, f32) {
     (c + radius * rad.cos(), c + radius * rad.sin())
 }
 
-/// A visually distinct color for wedge index `i` of `n`, as `#rrggbb`. Hues are
-/// spread evenly around the wheel with fixed saturation/value for a clean look.
-fn wedge_color(i: usize, n: usize) -> String {
-    let n = n.max(1);
-    let hue = (i as f32 / n as f32) * 360.0;
-    let (r, g, b) = hsv_to_rgb(hue, 0.55, 0.85);
+/// Color for a wedge whose fill hue is its position on the pie: the hue (in
+/// degrees) equals the wedge's start angle clockwise from 12 o'clock, so a
+/// slice starting at 12 o'clock is red (hue 0), at 3 o'clock green-ish
+/// (hue 90), at 6 o'clock cyan (hue 180), at 9 o'clock magenta (hue 270), and
+/// so on around the wheel. Returned as `#rrggbb`.
+fn wedge_color(hue_deg: f32) -> String {
+    let (r, g, b) = hsv_to_rgb(hue_deg, 0.55, 0.85);
     format!("#{:02x}{:02x}{:02x}", r, g, b)
 }
 
@@ -300,8 +437,8 @@ pub fn wedges(scan: &DirScan) -> Vec<Wedge> {
     // slices and roll the remaining long tail into a single "Other" slice, so a
     // directory with thousands of tiny files (e.g. WinSxS) doesn't become a
     // mass of sub-pixel, border-only slivers (and we don't emit thousands of
-    // Path elements). The combined slices are colored for `slice_count` so the
-    // hue spread stays even.
+    // Path elements). Each slice's color is its hue by angular position, so the
+    // wheel reads continuously (red at 12 o'clock, around through the hues).
     let shown = scan.entries.len().min(MAX_WEDGES);
     let tail = &scan.entries[shown..];
     let tail_bytes: u64 = tail
@@ -316,7 +453,7 @@ pub fn wedges(scan: &DirScan) -> Vec<Wedge> {
     let pct = |bytes: u64| (bytes as f64 / total as f64 * 100.0).round() as i64;
     let sweep_of = |bytes: u64| (bytes as f64 / total as f64 * 360.0) as f32;
 
-    for (i, e) in scan.entries.iter().take(shown).enumerate() {
+    for e in scan.entries.iter().take(shown) {
         let sweep = sweep_of(e.size_bytes);
         out.push(Wedge {
             name: e.name.clone(),
@@ -325,7 +462,7 @@ pub fn wedges(scan: &DirScan) -> Vec<Wedge> {
             size_text: crate::mounts::format_bytes(e.size_bytes),
             percent_text: format!("{}%", pct(e.size_bytes)),
             commands: wedge_commands(cursor, sweep),
-            color: wedge_color(i, slice_count),
+            color: wedge_color(cursor),
             start_deg: cursor,
             sweep_deg: sweep,
         });
@@ -342,7 +479,7 @@ pub fn wedges(scan: &DirScan) -> Vec<Wedge> {
             size_text: crate::mounts::format_bytes(tail_bytes),
             percent_text: format!("{}%", pct(tail_bytes)),
             commands: wedge_commands(cursor, sweep),
-            color: wedge_color(slice_count - 1, slice_count),
+            color: wedge_color(cursor),
             start_deg: cursor,
             sweep_deg: sweep,
         });
@@ -486,6 +623,59 @@ mod tests {
     }
 
     #[test]
+    fn wedge_color_follows_start_angle_hue() {
+        // The fill color is HSV with hue = the wedge's start angle. Spot-check
+        // the cardinal positions: 0° (12 o'clock) is red (R dominant), 120° is
+        // green-dominant, 240° is blue-dominant. Each wedge's `color` must
+        // match `wedge_color(start_deg)` exactly, so the pie and legend agree.
+        let hues = [
+            (0.0f32, (true, false, false)),   // red
+            (120.0, (false, true, false)),    // green
+            (240.0, (false, false, true)),    // blue
+        ];
+        for (hue, (r_max, g_max, b_max)) in hues {
+            let c = wedge_color(hue);
+            assert!(c.starts_with('#') && c.len() == 7, "bad color: {c}");
+            let r = u8::from_str_radix(&c[1..3], 16).unwrap();
+            let g = u8::from_str_radix(&c[3..5], 16).unwrap();
+            let b = u8::from_str_radix(&c[5..7], 16).unwrap();
+            if r_max {
+                assert!(r >= g && r >= b, "hue {hue} should be red-dominant: {c}");
+            }
+            if g_max {
+                assert!(g >= r && g >= b, "hue {hue} should be green-dominant: {c}");
+            }
+            if b_max {
+                assert!(b >= r && b >= g, "hue {hue} should be blue-dominant: {c}");
+            }
+        }
+
+        // In a real scan, the first wedge starts at 0° so it is colored by
+        // hue 0 (red), and its color equals wedge_color(start_deg).
+        let scan = DirScan {
+            entries: vec![
+                Entry { name: "a".into(), path: "/a".into(), is_dir: true, size_bytes: 50 },
+                Entry { name: "b".into(), path: "/b".into(), is_dir: false, size_bytes: 50 },
+            ],
+            total_bytes: 100,
+        };
+        let ws = wedges(&scan);
+        for w in &ws {
+            assert_eq!(
+                w.color,
+                wedge_color(w.start_deg),
+                "wedge color must be its start-angle hue"
+            );
+        }
+        // First wedge begins at 12 o'clock → red-dominant.
+        let first = &ws[0];
+        let r = u8::from_str_radix(&first.color[1..3], 16).unwrap();
+        let g = u8::from_str_radix(&first.color[3..5], 16).unwrap();
+        let b = u8::from_str_radix(&first.color[5..7], 16).unwrap();
+        assert!(r >= g && r >= b, "first wedge should be red: {}", first.color);
+    }
+
+    #[test]
     fn many_entries_group_into_other() {
         // More entries than MAX_WEDGES: expect MAX_WEDGES slices plus one
         // "Other" slice, together spanning the full circle with no gap.
@@ -582,5 +772,114 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn same_volume_disabled_when_no_root_vol() {
+        // With no known root volume (e.g. non-Unix), the boundary check is a
+        // no-op: everything counts as same-volume.
+        let tmp = std::env::temp_dir().join(format!("ss_vol_none_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let meta = fs::metadata(&tmp).unwrap();
+        assert!(same_volume(None, &tmp, &meta));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_respects_mount_boundary() {
+        // dir_size descends into same-volume subdirectories but not into ones
+        // on a different volume. We can't create a real mount point in a unit
+        // test, so we drive the boundary directly:
+        //
+        //   root/
+        //     a.bin        (file)
+        //     sub/
+        //       b.bin      (file, only counted if we descend into `sub`)
+        //
+        // With root_vol = the tree's real volume, `sub` is descended into and
+        // b.bin is counted. With a bogus root_vol that matches nothing, `sub`
+        // is treated as a foreign mount: its inode counts, but b.bin does not.
+        let tmp = std::env::temp_dir().join(format!("ss_mount_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("sub")).unwrap();
+        fs::write(tmp.join("a.bin"), vec![0u8; 40_000]).unwrap();
+        fs::write(tmp.join("sub").join("b.bin"), vec![0u8; 500_000]).unwrap();
+
+        let real_vol = volume_id_of_path(&tmp, &fs::metadata(&tmp).unwrap());
+        assert!(real_vol.is_some(), "unix exposes a volume id");
+        // A volume id that won't match the tree's real one.
+        let bogus_vol = real_vol.map(|d| d ^ 0xFFFF_FFFF);
+
+        let with_descend = dir_size(&tmp, real_vol);
+        let without_descend = dir_size(&tmp, bogus_vol);
+
+        // Descending includes the big nested file; not descending excludes it.
+        assert!(
+            with_descend >= 540_000,
+            "same-volume scan should include nested file: {with_descend}"
+        );
+        assert!(
+            without_descend < with_descend,
+            "cross-volume scan must not descend into the foreign subdir \
+             (with={with_descend}, without={without_descend})"
+        );
+        // The foreign-mount case still counts the top-level file and the
+        // `sub` inode itself (just not its contents).
+        assert!(without_descend >= 40_000);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// macOS: the firmlinked System (`/`) and Data (`/System/Volumes/Data`)
+    /// halves are one *logical* volume, so a scan of `/` walks into `/Users`,
+    /// `/Applications`, … (which live on Data). Those must share `/`'s volume
+    /// id. The Data backing mount itself is skipped by `is_firmlink_backing_path`
+    /// so its contents aren't counted a second time.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_firmlinked_data_is_same_logical_volume() {
+        let root_meta = match fs::metadata("/") {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let root_vol = volume_id_of_path(Path::new("/"), &root_meta);
+        assert!(root_vol.is_some(), "macOS exposes a volume id for /");
+
+        // Firmlinked Data entries read as the same logical volume as `/`, so the
+        // scanner descends into them and reports their real sizes.
+        for p in ["/System/Volumes/Data", "/Users", "/Applications", "/private"] {
+            let path = Path::new(p);
+            if let Ok(m) = fs::metadata(path) {
+                assert_eq!(
+                    volume_id_of_path(path, &m),
+                    root_vol,
+                    "{p} should fold onto the root logical volume"
+                );
+            }
+        }
+
+        // System-volume paths also match `/` (same mount-on name).
+        if let Ok(m) = fs::metadata("/System/Library") {
+            assert_eq!(
+                volume_id_of_path(Path::new("/System/Library"), &m),
+                root_vol,
+                "/System/Library is on the System volume, same as /"
+            );
+        }
+
+        // But the Data *backing* mount is not descended into (its contents are
+        // already counted via the firmlinks), so we don't double-count it.
+        assert!(is_firmlink_backing_path(Path::new("/System/Volumes/Data")));
+        assert!(is_firmlink_backing_path(Path::new("/System/Volumes/Data/Users")));
+        assert!(is_firmlink_backing_path(Path::new("/System/Volumes/VM")));
+        assert!(!is_firmlink_backing_path(Path::new("/Users")));
+        assert!(!is_firmlink_backing_path(Path::new("/System/Library")));
+
+        // A separate real volume (e.g. an external disk) keeps a distinct id and
+        // is still never crossed. We can't guarantee one is mounted, so only
+        // check when `/Volumes` has a sibling that isn't the root alias.
+        // (Covered functionally by `dir_size_respects_mount_boundary`.)
     }
 }

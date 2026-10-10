@@ -110,6 +110,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     // Populate the mounted drives / mount points list shown in the main window.
     refresh_mounts(&window, ctrl.borrow().settings.show_network_shares);
+    if let Ok(dir) = std::env::var("SS_VERIFY_VOLUME") { open_volume_window(&ctrl, &window, &dir); }
 
     // macOS: install the native menu bar (File/Edit/Help plus About and
     // Settings in the Application menu, License Key under Help). The returned
@@ -452,6 +453,34 @@ fn webbrowser_open(url: &str) -> std::io::Result<()> {
     }
 }
 
+/// Open a file or directory with the OS default handler (the file's default
+/// application, or the system file manager for a directory).
+fn os_open_path(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `explorer <path>` opens files with their default app and directories
+        // in a new Explorer window.
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+}
+
 /// Build a Slint image from raw RGBA8 bytes.
 fn rgba_to_image(width: u32, height: u32, rgba: &[u8]) -> slint::Image {
     let mut buf = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
@@ -534,6 +563,15 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
     win.set_theme_dark(main.get_theme_dark());
     win.set_base_font_size(main.get_base_font_size());
     win.set_window_icon(main.get_window_icon());
+    // Inherit the OS highlight color (for the action buttons' pressed state).
+    // Only when the real OS colors were resolved; otherwise the window keeps
+    // its built-in selection-color fallback.
+    {
+        let theme = main.global::<Theme>();
+        if theme.get_has_sys_colors() {
+            win.set_highlight_color(theme.get_sys_highlight());
+        }
+    }
     // Windows/Linux use the Slint declarative menu bar; macOS gets a native
     // menu installed below.
     #[cfg(not(target_os = "macos"))]
@@ -639,6 +677,24 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
         }
     });
 
+    // Refresh: drop the cached scan for the current directory (and everything
+    // cached beneath it, so re-drilling also re-reads) and scan it fresh from
+    // disk. `rescan_volume` would otherwise hit the cache and redisplay the
+    // stale result instantly.
+    win.on_refresh({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                {
+                    let s = state.borrow();
+                    scan_cache_invalidate_under(&s.current);
+                }
+                rescan_volume(&w, &state);
+            }
+        }
+    });
+
     // Selection: plain click selects one row; Shift extends a contiguous range
     // from the anchor; Ctrl/Cmd toggles the row (discontiguous). The resulting
     // mask is pushed back into the window.
@@ -663,6 +719,60 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
                 let new_anchor = apply_selection(&mut s.selected, anchor, index, shift, toggle);
                 s.anchor = new_anchor;
                 push_selection(&w, &s.selected);
+                drop(s);
+                // Bring the just-selected row into view if it's off-screen.
+                w.set_scroll_to_index(index as i32);
+                w.set_scroll_generation(w.get_scroll_generation() + 1);
+            }
+        }
+    });
+
+    // Selection from the pie: map the clicked angle to a wedge and apply the
+    // same selection logic as `on_select`. Wedges with an empty path (the
+    // synthetic "Other" grouping) are not selectable.
+    win.on_select_at_angle({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move |deg, shift, toggle| {
+            if let Some(w) = handle.upgrade() {
+                let Some(index) = wedge_at_angle(&w, deg) else {
+                    return;
+                };
+                let count = w.get_wedges().row_count();
+                let mut s = state.borrow_mut();
+                if s.selected.len() != count {
+                    s.selected = vec![false; count];
+                }
+                let anchor = s.anchor;
+                let new_anchor = apply_selection(&mut s.selected, anchor, index, shift, toggle);
+                s.anchor = new_anchor;
+                push_selection(&w, &s.selected);
+            }
+        }
+    });
+
+    // Right-click on the pie: select the wedge if it isn't already selected,
+    // so the context-menu action operates on it (mirrors `ensure-selected`).
+    win.on_ensure_selected_at_angle({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move |deg| {
+            if let Some(w) = handle.upgrade() {
+                let Some(index) = wedge_at_angle(&w, deg) else {
+                    return;
+                };
+                let mut s = state.borrow_mut();
+                let count = w.get_wedges().row_count();
+                if s.selected.len() != count {
+                    s.selected = vec![false; count];
+                }
+                if s.selected.get(index).copied().unwrap_or(false) {
+                    return; // already selected
+                }
+                let anchor = s.anchor;
+                let new_anchor = apply_selection(&mut s.selected, anchor, index, false, false);
+                s.anchor = new_anchor;
+                push_selection(&w, &s.selected);
             }
         }
     });
@@ -674,6 +784,12 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
         let handle = win.as_weak();
         move || {
             if let Some(w) = handle.upgrade() {
+                // Dismiss the confirmation dialog ourselves so the single
+                // click that triggered this does the whole job (dismiss +
+                // delete). Toggling the Slint-side flag inside the button's
+                // own handler tore the dialog down mid-click and could drop
+                // the first activation.
+                w.set_show_confirm_delete(false);
                 let paths = selected_paths(&w, &state.borrow().selected);
                 if paths.is_empty() {
                     return;
@@ -731,23 +847,53 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
     });
 
     // Confirmed: permanently delete each selected entry (no trash, no undo),
-    // then invalidate the cache and re-scan so the chart updates.
+    // then invalidate the cache and re-scan so the chart updates. Finally show
+    // a results dialog listing what was removed and what could not be (e.g.
+    // permission errors).
     win.on_confirm_delete({
         let state = state.clone();
         let handle = win.as_weak();
         move || {
             if let Some(w) = handle.upgrade() {
+                // Dismiss the confirmation dialog here (not in the button's own
+                // Slint handler): tearing the dialog subtree down mid-click
+                // dropped the first activation and needed a second click.
+                w.set_show_confirm_delete(false);
+
                 let paths = selected_paths(&w, &state.borrow().selected);
+
+                // Collect outcomes so we can report them to the user.
+                let mut deleted: Vec<String> = Vec::new();
+                let mut failed: Vec<String> = Vec::new();
                 for (path, is_dir) in &paths {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    let label = if *is_dir {
+                        format!("{name}/")
+                    } else {
+                        name
+                    };
                     let result = if *is_dir {
                         std::fs::remove_dir_all(path)
                     } else {
                         std::fs::remove_file(path)
                     };
-                    if let Err(e) = result {
-                        tracing::warn!("delete failed for {}: {e}", path.display());
+                    match result {
+                        Ok(()) => deleted.push(format!("• {label}")),
+                        Err(e) => {
+                            tracing::warn!("delete failed for {}: {e}", path.display());
+                            failed.push(format!("• {label}  —  {e}"));
+                        }
                     }
                 }
+
+                // Populate and show the results dialog.
+                w.set_deleted_names(SharedString::from(deleted.join("\n")));
+                w.set_failed_names(SharedString::from(failed.join("\n")));
+                w.set_show_delete_results(true);
+
                 // Clear the selection and refresh from disk.
                 {
                     let mut s = state.borrow_mut();
@@ -766,6 +912,20 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
         let _ = webbrowser_open(&url);
     });
 
+    // "Open": hand each selected file/dir to the OS to open with its default
+    // application / file manager.
+    win.on_open_selection({
+        let state = state.clone();
+        let handle = win.as_weak();
+        move || {
+            if let Some(w) = handle.upgrade() {
+                for (path, _is_dir) in selected_paths(&w, &state.borrow().selected) {
+                    let _ = os_open_path(&path);
+                }
+            }
+        }
+    });
+
     // The volume label: the mount's last path component, or the whole path for
     // the root "/".
     let label = root
@@ -779,6 +939,14 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
     scan_cache_invalidate_under(&root);
 
     rescan_volume(&win, &state);
+
+    // macOS: wire the native (muda) right-click menu. The Slint
+    // `ContextMenuArea` in volume.slint is used on Windows/Linux only; on
+    // macOS its muda events would be swallowed by our app menu's global muda
+    // handler, so we show the menu ourselves instead (see `menu_macos`).
+    #[cfg(target_os = "macos")]
+    crate::menu_macos::attach_volume_window(&win);
+
     let _ = win.show();
 
     ctrl.borrow_mut()
@@ -908,6 +1076,17 @@ fn parent_within_root(
         // Parent escapes the volume root (shouldn't happen) — clamp to root.
         _ => Some(root.to_path_buf()),
     }
+}
+
+/// The index of the wedge whose angular span contains `deg` (clockwise from 12
+/// o'clock), or `None` for a miss or the synthetic "Other" grouping wedge
+/// (which has an empty path and isn't individually selectable).
+fn wedge_at_angle(w: &VolumeWindow, deg: f32) -> Option<usize> {
+    let wedges = w.get_wedges();
+    (0..wedges.row_count()).find(|&i| {
+        let e = wedges.row_data(i).unwrap();
+        !e.path.is_empty() && deg >= e.start_deg && deg < e.start_deg + e.sweep_deg
+    })
 }
 
 /// Update `mask` in place for a click on `index` and return the new anchor.

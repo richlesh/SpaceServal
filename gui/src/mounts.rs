@@ -262,14 +262,32 @@ mod network {
         })
     }
 
-    /// Network shares (SMB/NFS/AFP/WebDAV/…): every browsable non-local mount.
+    /// Whether a mount should be listed as a network share, from its
+    /// file-system type and two mount flags. Pure so it can be unit-tested
+    /// without fabricating `statfs`.
+    ///
+    /// A mount counts as a share when either its file-system type is a
+    /// recognized network protocol (SMB/NFS/AFP/WebDAV/…) — kept even if it's
+    /// `nobrowse` — or it's a non-local, browsable mount (covering protocols
+    /// not in the name list).
+    pub(super) fn is_network_share(fstype: &str, non_local: bool, dontbrowse: bool) -> bool {
+        super::is_network_fs(fstype) || (non_local && !dontbrowse)
+    }
+
+    /// Network shares (SMB/NFS/AFP/WebDAV/…). Non-network local volumes are
+    /// never included here; they come from sysinfo. autofs placeholders are
+    /// dropped by `to_mount`.
     pub fn list() -> Vec<Mount> {
         scan()
             .iter()
-            // Hidden mounts (e.g. Time Machine's backup share) aren't shown in
-            // Finder either.
-            .filter(|s| !has_flag(s, libc::MNT_DONTBROWSE as u32))
-            .filter(|s| !has_flag(s, libc::MNT_LOCAL as u32))
+            .filter(|s| {
+                let fs = cstr(&s.f_fstypename);
+                is_network_share(
+                    &fs,
+                    !has_flag(s, libc::MNT_LOCAL as u32),
+                    has_flag(s, libc::MNT_DONTBROWSE as u32),
+                )
+            })
             .filter_map(|s| to_mount(s, true, false))
             .collect()
     }
@@ -618,6 +636,28 @@ mod tests {
                 m.mount_point
             );
         }
+    }
+
+    /// The macOS share predicate: recognized network filesystems are always
+    /// treated as shares (even when flagged `nobrowse`); unknown types count
+    /// only when non-local and browsable; local volumes are never shares.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_network_share_predicate() {
+        use super::network::is_network_share;
+        // SMB/NFS/AFP: shares regardless of the browse flag.
+        assert!(is_network_share("smbfs", true, false));
+        assert!(is_network_share("smbfs", true, true), "nobrowse SMB still a share");
+        assert!(is_network_share("nfs", false, false), "network fs even if flagged local");
+        assert!(is_network_share("afpfs", true, false));
+        assert!(is_network_share("webdav", true, false));
+        // Unknown fstype: a share only when non-local and browsable.
+        assert!(is_network_share("myproto", true, false));
+        assert!(!is_network_share("myproto", true, true), "nobrowse unknown is not shown");
+        assert!(!is_network_share("myproto", false, false), "local unknown is not a share");
+        // Local volumes are never network shares.
+        assert!(!is_network_share("apfs", false, false));
+        assert!(!is_network_share("apfs", false, true));
     }
 
     #[cfg(target_os = "macos")]

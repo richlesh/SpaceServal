@@ -37,6 +37,103 @@ export struct ExplainEntry {
     online-url: string,
 }
 
+// A square, icon-only toolbar button used for the volume window's actions.
+// Draws one of a few built-in line icons, flashes the OS highlight color while
+// pressed, dims when disabled, and shows a hover tooltip below itself.
+component IconButton inherits Rectangle {
+    // Which icon to draw: "open" (open folder), "question", "trash", or
+    // "refresh" (circular reload arrow).
+    in property <string> icon-kind;
+    in property <string> tooltip;
+    in property <bool> enabled: true;
+    // Theme-driven colors supplied by the owner.
+    in property <brush> icon-color;
+    in property <brush> muted-color;
+    in property <brush> hover-color;
+    in property <brush> highlight-color;
+    in property <brush> highlight-text;
+    in property <brush> tooltip-bg;
+    in property <brush> tooltip-border;
+    in property <length> base-size: 15px;
+
+    callback clicked();
+    // Hover reporting: the owner renders the tooltip in a top-level overlay so
+    // it draws above sibling content (e.g. the file list). `x`/`y` are the
+    // desired tooltip top-left in window coordinates.
+    callback show-tip(string /* text */, length /* win x */, length /* win y */);
+    callback hide-tip();
+
+    // Square, sized relative to the font.
+    width: root.base-size * 2.2;
+    height: self.width;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.enabled ? root.hover-color : transparent;
+    // Pressed = OS highlight; hovered = subtle wash; otherwise flat.
+    background: !root.enabled
+        ? transparent
+        : (touch.pressed ? root.highlight-color
+            : (touch.has-hover ? root.hover-color : transparent));
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    // Icon glyph. Stroked line-art in a 24x24 viewbox; the stroke color
+    // flips to the highlight-text color while pressed for contrast.
+    icon := Path {
+        // Icon occupies 75% of the button (50% larger than the previous 50%),
+        // kept centered.
+        x: parent.width * 0.125;
+        y: parent.height * 0.125;
+        width: parent.width * 0.75;
+        height: parent.height * 0.75;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: transparent;
+        stroke: touch.pressed ? root.highlight-text : root.icon-color;
+        stroke-width: 2px;
+        // Round caps/joins so the question-mark stem and dot read cleanly.
+        stroke-line-cap: round;
+        commands:
+            root.icon-kind == "open"
+                // Open folder.
+                ? "M 3 7 L 3 19 L 21 19 L 21 10 L 10 10 L 8 7 Z"
+            : root.icon-kind == "trash"
+                // Trash can: lid, handle, body, two stripes.
+                ? "M 4 6 L 20 6 M 9 6 L 9 4 L 15 4 L 15 6 "
+                    + "M 6 6 L 7 20 L 17 20 L 18 6 "
+                    + "M 10 10 L 10 17 M 14 10 L 14 17"
+            : root.icon-kind == "refresh"
+                // Reload: a near-full circular arrow (gap at the top-right)
+                // with an arrowhead at the open end, like a browser refresh.
+                // Geometry: center (12,12), r=8, a 300deg clockwise arc leaving
+                // a gap at the top; the arrowhead sits tangent at the open end.
+                ? "M 19.518 9.264 A 8 8 0 1 1 13.389 4.122 "  // 300deg arc, clockwise
+                    + "M 9.068 5.594 L 13.389 4.122 L 9.832 1.260"  // tangent arrowhead
+                // Question mark: hook, a prominent vertical stem at the
+                // bottom, and a round dot clearly separated underneath.
+                : "M 8.5 9 C 8.5 6 11 5 12 5 C 14 5 15.5 6.3 15.5 8.3 "
+                    + "C 15.5 10.5 12 11 12 13 "   // hook into the stem top
+                    + "M 12 13 L 12 16 "            // prominent vertical stem
+                    + "M 12 19.5 L 12 19.7";        // round dot underneath
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (self.has-hover && root.enabled && root.tooltip != "") {
+                // Report the anchor just below the button, horizontally
+                // centered, in window coordinates.
+                root.show-tip(root.tooltip,
+                    root.absolute-position.x,
+                    root.absolute-position.y + root.height + 4px);
+            } else {
+                root.hide-tip();
+            }
+        }
+    }
+}
+
 export component VolumeWindow inherits Window {
     title: "SpaceServal — " + root.volume-name;
     preferred-width: 760px;
@@ -72,6 +169,13 @@ export component VolumeWindow inherits Window {
     // File-menu / right-click actions.
     in property <int> selection-count: 0;
 
+    // Request to scroll a legend row into view (e.g. after a pie-wedge click
+    // selected an off-screen row). The controller sets `scroll-to-index` to
+    // the row and bumps `scroll-generation` to trigger the scroll even when
+    // the same index is requested twice in a row. -1 means "no request".
+    in property <int> scroll-to-index: -1;
+    in property <int> scroll-generation: 0;
+
     // Navigation.
     callback drill-in(int /* index */);
     callback drill-at-angle(float /* degrees */);
@@ -81,11 +185,29 @@ export component VolumeWindow inherits Window {
     // (toggle) held. The controller updates `selected` + `selection-count`.
     callback select(int /* index */, bool /* shift */, bool /* toggle */);
 
+    // Selection from the pie chart: the wedge at `degrees` (clockwise from 12
+    // o'clock) was clicked. The controller maps the angle to a wedge index and
+    // applies the same selection logic as `select`.
+    callback select-at-angle(float /* degrees */, bool /* shift */, bool /* toggle */);
+    // Like `ensure-selected`, but for a pie wedge: selects the wedge at the
+    // angle if it isn't already selected (used before a right-click menu).
+    callback ensure-selected-at-angle(float /* degrees */);
+
     // Actions operating on the current selection.
     callback explain-selection();
     callback delete-selection();        // opens the confirm dialog
     callback confirm-delete();          // user confirmed — actually delete
     callback open-url(string);          // open a reference in the browser
+    callback open-selection();          // open selected items with the OS
+    // Discard the current directory's cached scan and re-read it from disk.
+    // Unlike the selection actions, this needs no selection.
+    callback refresh();
+
+    // macOS only: the legend was right-clicked at the given window-relative
+    // point. The controller shows a native muda context menu there (Slint's
+    // own `ContextMenuArea` can't be used on macOS — see `menu_macos`). The
+    // right-clicked row is selected first via `ensure-selected`.
+    callback request-context-menu(length /* win x */, length /* win y */);
 
     // Pie hover.
     callback hover-at-angle(float /* degrees */);
@@ -98,6 +220,15 @@ export component VolumeWindow inherits Window {
     in-out property <bool> show-confirm-delete: false;
     // Human-readable list of what will be deleted, shown in the chicken dialog.
     in property <string> confirm-names: "";
+
+    // Delete-results dialog, shown after a delete completes. Lists what was
+    // removed and what could not be removed (e.g. permission errors).
+    in-out property <bool> show-delete-results: false;
+    // Multi-line list of successfully deleted entries ("" ⇒ none).
+    in property <string> deleted-names: "";
+    // Multi-line list of entries that could not be deleted, each with the
+    // reason ("" ⇒ none).
+    in property <string> failed-names: "";
 
     property <bool> working-bright: false;
 
@@ -113,6 +244,18 @@ export component VolumeWindow inherits Window {
     property <brush> scrim: dark ? #000000c0 : #00000060;
     property <brush> danger: dark ? #e0a0a0 : #b00020;
 
+    // Toolbar-button tooltip overlay state. The tooltip is rendered as the
+    // window's last child so it draws on top of the file list; the icon
+    // buttons feed it via `show-tip` / `hide-tip`.
+    property <string> tip-text: "";
+    property <length> tip-x;
+    property <length> tip-y;
+
+    // The OS highlight/accent color, pushed in by the controller so the icon
+    // buttons flash in the user's chosen color when pressed. Falls back to the
+    // local selection color when the OS color isn't available.
+    in property <brush> highlight-color: root.sel;
+
     // Live modifier-key state, tracked by the FocusScope below so a legend
     // click can tell plain / Shift / Ctrl-Cmd apart.
     property <bool> shift-down: false;
@@ -122,6 +265,7 @@ export component VolumeWindow inherits Window {
 
     init => {
         Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+        key-scope.focus();
     }
     changed theme-dark => {
         Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
@@ -136,6 +280,17 @@ export component VolumeWindow inherits Window {
         if (!root.scanning) { root.working-bright = false; }
     }
 
+    // Scroll a requested legend row into view (e.g. after a pie-wedge click
+    // selected an off-screen row). `legend-scroll` is the legend ScrollView.
+    changed scroll-generation => {
+        if (root.scroll-to-index >= 0) {
+            legend-scroll.content-y = root.scroll-offset-for(
+                root.scroll-to-index,
+                legend-scroll.visible-height,
+                legend-scroll.content-y);
+        }
+    }
+
     function report-hover() {
         root.hover-at-angle(Math.mod(
             Math.atan2((pie-touch.mouse-x - pie.width / 2) / 1px,
@@ -143,10 +298,63 @@ export component VolumeWindow inherits Window {
                 / 1deg + 360, 360));
     }
 
+    // The pie angle (degrees, clockwise from 12 o'clock) under the pie
+    // pointer. Shared by hover, click-to-select, drill, and the right-click
+    // menu so they all agree on which wedge is under the cursor.
+    function pie-angle() -> float {
+        return Math.mod(
+            Math.atan2((pie-touch.mouse-x - pie.width / 2) / 1px,
+                       -(pie-touch.mouse-y - pie.height / 2) / 1px)
+                / 1deg + 360, 360);
+    }
+
+    // Legend row height (kept in sync with the row Rectangle below) and the
+    // VerticalLayout's top padding, used to compute scroll offsets.
+    property <length> row-h: root.base-font-size * 2 + 16px;
+    property <length> legend-pad: 8px;
+    property <length> legend-gap: 2px;
+
+    // New `content-y` for the legend ScrollView so row `index` is visible
+    // within a viewport of `visible-h`, given the current `cur-y`. `content-y`
+    // is 0 at the top and negative when scrolled down.
+    function scroll-offset-for(index: int, visible-h: length, cur-y: length) -> length {
+        if (index < 0) {
+            return cur-y;
+        }
+        // Row top in content coordinates (mirrors the VerticalLayout).
+        //   top    = legend-pad + index * (row-h + legend-gap)
+        //   bottom = top + row-h
+        // Visible content window is [-cur-y, -cur-y + visible-h].
+        // Above the view: bring the row's top to the viewport top.
+        if (root.legend-pad + index * (root.row-h + root.legend-gap) < -cur-y) {
+            return -(root.legend-pad + index * (root.row-h + root.legend-gap));
+        }
+        // Below the view: bring the row's bottom to the viewport bottom.
+        if (root.legend-pad + index * (root.row-h + root.legend-gap) + root.row-h
+                > -cur-y + visible-h) {
+            return min(0px, visible-h
+                - (root.legend-pad + index * (root.row-h + root.legend-gap) + root.row-h));
+        }
+        return cur-y;
+    }
+
+    // If row `i` isn't already selected, select just it (so a menu action on a
+    // right-clicked, previously-unselected row operates on that row).
+    function ensure-selected(i: int) {
+        if (!(i < root.selected.length && root.selected[i])) {
+            root.select(i, false, false);
+        }
+    }
+
     // Windows/Linux menu bar. macOS builds a native menu in Rust.
     if root.use-slint-menubar: MenuBar {
         Menu {
             title: "File";
+            MenuItem {
+                title: "Open";
+                enabled: root.selection-count > 0;
+                activated => { root.open-selection(); }
+            }
             MenuItem {
                 title: "What is this File";
                 enabled: root.selection-count > 0;
@@ -162,6 +370,10 @@ export component VolumeWindow inherits Window {
 
     // Track modifier keys for the whole window so legend clicks see them.
     key-scope := FocusScope {
+        // While a dialog is open, don't let the main scope hold focus — it
+        // would otherwise keep keyboard focus and the dialog's first click
+        // would be spent transferring focus to the dialog.
+        enabled: !root.show-explain && !root.show-confirm-delete && !root.show-delete-results;
         key-pressed(event) => {
             if (event.text == Key.Shift) { root.shift-down = true; }
             if (event.text == Key.Control) { root.ctrl-down = true; }
@@ -197,6 +409,77 @@ export component VolumeWindow inherits Window {
                     vertical-alignment: center;
                     overflow: elide;
                 }
+                // Action buttons mirror the File / right-click menu. Square
+                // icon buttons that act on the current selection; they flash
+                // the OS highlight color when pressed and show a tooltip on
+                // hover. Always available (the native menu bar isn't rendered
+                // on macOS).
+                IconButton {
+                    icon-kind: "open";
+                    tooltip: "Open";
+                    enabled: root.selection-count > 0;
+                    icon-color: root.text;
+                    muted-color: root.muted;
+                    hover-color: root.hover;
+                    highlight-color: root.highlight-color;
+                    highlight-text: #ffffff;
+                    tooltip-bg: root.dark ? #000000d0 : #ffffffe0;
+                    tooltip-border: root.hairline;
+                    base-size: root.base-font-size;
+                    clicked => { root.open-selection(); }
+                    show-tip(t, tx, ty) => { root.tip-text = t; root.tip-x = tx; root.tip-y = ty; }
+                    hide-tip => { root.tip-text = ""; }
+                }
+                IconButton {
+                    icon-kind: "question";
+                    tooltip: "What is this File";
+                    enabled: root.selection-count > 0;
+                    icon-color: root.text;
+                    muted-color: root.muted;
+                    hover-color: root.hover;
+                    highlight-color: root.highlight-color;
+                    highlight-text: #ffffff;
+                    tooltip-bg: root.dark ? #000000d0 : #ffffffe0;
+                    tooltip-border: root.hairline;
+                    base-size: root.base-font-size;
+                    clicked => { root.explain-selection(); }
+                    show-tip(t, tx, ty) => { root.tip-text = t; root.tip-x = tx; root.tip-y = ty; }
+                    hide-tip => { root.tip-text = ""; }
+                }
+                IconButton {
+                    icon-kind: "trash";
+                    tooltip: "Delete Immediately";
+                    enabled: root.selection-count > 0;
+                    icon-color: root.danger;
+                    muted-color: root.muted;
+                    hover-color: root.hover;
+                    highlight-color: root.highlight-color;
+                    highlight-text: #ffffff;
+                    tooltip-bg: root.dark ? #000000d0 : #ffffffe0;
+                    tooltip-border: root.hairline;
+                    base-size: root.base-font-size;
+                    clicked => { root.delete-selection(); }
+                    show-tip(t, tx, ty) => { root.tip-text = t; root.tip-x = tx; root.tip-y = ty; }
+                    hide-tip => { root.tip-text = ""; }
+                }
+                // Refresh: re-read the current directory from disk, bypassing
+                // the cache. Always enabled (it doesn't operate on a selection).
+                IconButton {
+                    icon-kind: "refresh";
+                    tooltip: "Refresh";
+                    enabled: !root.scanning;
+                    icon-color: root.text;
+                    muted-color: root.muted;
+                    hover-color: root.hover;
+                    highlight-color: root.highlight-color;
+                    highlight-text: #ffffff;
+                    tooltip-bg: root.dark ? #000000d0 : #ffffffe0;
+                    tooltip-border: root.hairline;
+                    base-size: root.base-font-size;
+                    clicked => { root.refresh(); }
+                    show-tip(t, tx, ty) => { root.tip-text = t; root.tip-x = tx; root.tip-y = ty; }
+                    hide-tip => { root.tip-text = ""; }
+                }
             }
 
             // Body: pie on the left, scrollable legend on the right.
@@ -216,23 +499,63 @@ export component VolumeWindow inherits Window {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
 
-                        for w[i] in root.wedges: Path {
+                        // Right-click menu for the wedge under the pointer.
+                        // Mirrors the legend's menu; the TouchArea below sits on
+                        // top and drives it programmatically (Win/Linux native
+                        // Slint; macOS routes to a muda menu in Rust) so the
+                        // left-click / double-click gestures still reach us.
+                        pie-ctx := ContextMenuArea {
                             width: 100%;
                             height: 100%;
-                            viewbox-width: 200;
-                            viewbox-height: 200;
-                            commands: w.commands;
-                            fill: w.color;
-                            stroke: root.card;
-                            stroke-width: 0.5px;
+                            Menu {
+                                MenuItem {
+                                    title: "Open";
+                                    activated => { root.open-selection(); }
+                                }
+                                MenuItem {
+                                    title: "What is this File";
+                                    activated => { root.explain-selection(); }
+                                }
+                                MenuItem {
+                                    title: "Delete Immediately…";
+                                    activated => { root.delete-selection(); }
+                                }
+                            }
+                            Rectangle {
+                                for w[i] in root.wedges: Path {
+                                    width: 100%;
+                                    height: 100%;
+                                    viewbox-width: 200;
+                                    viewbox-height: 200;
+                                    commands: w.commands;
+                                    fill: w.color;
+                                    stroke: root.card;
+                                    stroke-width: 0.5px;
+                                }
+                            }
                         }
 
+                        // On top of the wedges + ctx so clicks reliably reach
+                        // it. Left-click selects the wedge's row; right-click
+                        // selects it then opens the menu; double-click drills.
                         pie-touch := TouchArea {
-                            double-clicked => {
-                                root.drill-at-angle(Math.mod(
-                                    Math.atan2((self.mouse-x - pie.width / 2) / 1px,
-                                               -(self.mouse-y - pie.height / 2) / 1px)
-                                        / 1deg + 360, 360));
+                            double-clicked => { root.drill-at-angle(root.pie-angle()); }
+                            clicked => {
+                                root.select-at-angle(root.pie-angle(), root.shift-down, root.ctrl-down);
+                                key-scope.focus();
+                            }
+                            pointer-event(ev) => {
+                                if (ev.button == PointerEventButton.right
+                                    && ev.kind == PointerEventKind.down) {
+                                    root.ensure-selected-at-angle(root.pie-angle());
+                                    if (root.use-slint-menubar) {
+                                        pie-ctx.show({ x: self.mouse-x, y: self.mouse-y });
+                                    } else {
+                                        root.request-context-menu(
+                                            self.absolute-position.x + self.mouse-x,
+                                            self.absolute-position.y + self.mouse-y);
+                                    }
+                                }
                             }
                             changed mouse-x => { root.report-hover(); }
                             changed mouse-y => { root.report-hover(); }
@@ -287,7 +610,7 @@ export component VolumeWindow inherits Window {
                     border-width: 1px;
                     border-color: root.hairline;
 
-                    ScrollView {
+                    legend-scroll := ScrollView {
                         VerticalLayout {
                             padding: 8px;
                             spacing: 2px;
@@ -297,38 +620,24 @@ export component VolumeWindow inherits Window {
                                     ? root.sel
                                     : (legend-touch.has-hover ? root.hover : transparent);
                                 border-radius: 4px;
-                                ContextMenuArea {
+                                // Right-click menu, shown programmatically from
+                                // the TouchArea below so left-clicks (select)
+                                // and double-clicks (drill) still reach us.
+                                ctx := ContextMenuArea {
                                     enabled: w.path != "";
                                     Menu {
                                         MenuItem {
+                                            title: "Open";
+                                            activated => { root.ensure-selected(i); root.open-selection(); }
+                                        }
+                                        MenuItem {
                                             title: "What is this File";
-                                            activated => {
-                                                // Right-clicking an unselected
-                                                // row selects it first.
-                                                if (!(i < root.selected.length && root.selected[i])) {
-                                                    root.select(i, false, false);
-                                                }
-                                                root.explain-selection();
-                                            }
+                                            activated => { root.ensure-selected(i); root.explain-selection(); }
                                         }
                                         MenuItem {
                                             title: "Delete Immediately…";
-                                            activated => {
-                                                if (!(i < root.selected.length && root.selected[i])) {
-                                                    root.select(i, false, false);
-                                                }
-                                                root.delete-selection();
-                                            }
+                                            activated => { root.ensure-selected(i); root.delete-selection(); }
                                         }
-                                    }
-                                    legend-touch := TouchArea {
-                                        mouse-cursor: w.is-dir ? pointer : default;
-                                        clicked => {
-                                            if (w.path != "") {
-                                                root.select(i, root.shift-down, root.ctrl-down);
-                                            }
-                                        }
-                                        double-clicked => { root.drill-in(i); }
                                     }
                                     legend-row := HorizontalBox {
                                         padding-left: 6px;
@@ -360,6 +669,39 @@ export component VolumeWindow inherits Window {
                                         }
                                     }
                                 }
+                                // On top so clicks reliably reach it. Left-click
+                                // selects; right-click opens the context menu at
+                                // the pointer; double-click drills in.
+                                legend-touch := TouchArea {
+                                    mouse-cursor: w.is-dir ? pointer : default;
+                                    pointer-event(ev) => {
+                                        if (ev.button == PointerEventButton.right
+                                            && ev.kind == PointerEventKind.down
+                                            && w.path != "") {
+                                            root.ensure-selected(i);
+                                            // Windows/Linux use Slint's native
+                                            // ContextMenuArea. macOS routes to a
+                                            // muda menu built in Rust, because
+                                            // Slint's context-menu muda events
+                                            // are swallowed by our app menu's
+                                            // global muda handler there.
+                                            if (root.use-slint-menubar) {
+                                                ctx.show({ x: self.mouse-x, y: self.mouse-y });
+                                            } else {
+                                                root.request-context-menu(
+                                                    self.absolute-position.x + self.mouse-x,
+                                                    self.absolute-position.y + self.mouse-y);
+                                            }
+                                        }
+                                    }
+                                    clicked => {
+                                        if (w.path != "") {
+                                            root.select(i, root.shift-down, root.ctrl-down);
+                                            key-scope.focus();
+                                        }
+                                    }
+                                    double-clicked => { root.drill-in(i); }
+                                }
                             }
                         }
                     }
@@ -390,7 +732,26 @@ export component VolumeWindow inherits Window {
     if root.show-explain: Rectangle {
         background: root.scrim;
         TouchArea { clicked => { root.show-explain = false; } }
-        Rectangle {
+        // Grab keyboard focus the moment the dialog appears, so the first
+        // click lands on a button instead of being spent transferring focus
+        // into the dialog. (The main `key-scope` is disabled while a dialog is
+        // open, which releases focus but doesn't hand it to anyone.)
+        explain-focus := FocusScope {
+            // Grabbing focus in `init` races with layout and with the main
+            // key-scope being disabled, so focus often doesn't stick. A
+            // one-shot timer re-grabs it on the next tick, once the dialog is
+            // laid out and the main scope has released focus.
+            init => { explain-focus.focus(); }
+            Timer {
+                interval: 1ms;
+                running: root.show-explain;
+                triggered => { explain-focus.focus(); self.running = false; }
+            }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) { root.show-explain = false; }
+                accept
+            }
+            Rectangle {
             width: min(root.width - 80px, 520px);
             height: min(root.height - 80px, 560px);
             background: root.card-bg;
@@ -443,6 +804,7 @@ export component VolumeWindow inherits Window {
                     Button { text: "Close"; clicked => { root.show-explain = false; } }
                 }
             }
+            }
         }
     }
 
@@ -450,7 +812,24 @@ export component VolumeWindow inherits Window {
     if root.show-confirm-delete: Rectangle {
         background: root.scrim;
         TouchArea { clicked => { root.show-confirm-delete = false; } }
-        Rectangle {
+        // Grab keyboard focus the moment the dialog appears, so the first
+        // click lands on a button instead of being spent transferring focus
+        // into the dialog.
+        confirm-focus := FocusScope {
+            // See the explain dialog: a one-shot timer re-grabs focus once the
+            // dialog is laid out and the main scope has released focus, so the
+            // first key/click lands here instead of being spent on focus.
+            init => { confirm-focus.focus(); }
+            Timer {
+                interval: 1ms;
+                running: root.show-confirm-delete;
+                triggered => { confirm-focus.focus(); self.running = false; }
+            }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) { root.show-confirm-delete = false; }
+                accept
+            }
+            Rectangle {
             width: min(root.width - 80px, 460px);
             height: confirm-col.preferred-height + 32px;
             background: root.card-bg;
@@ -496,12 +875,136 @@ export component VolumeWindow inherits Window {
                     Button {
                         text: "Delete Permanently";
                         clicked => {
-                            root.show-confirm-delete = false;
+                            // The controller performs the delete AND dismisses
+                            // the dialog (`set_show_confirm_delete(false)`).
+                            // Doing the dismiss here instead tore this subtree
+                            // down mid-click and dropped the first activation
+                            // (needing a second click).
                             root.confirm-delete();
                         }
                     }
                 }
             }
+            }
+        }
+    }
+
+    // ---- Delete results dialog --------------------------------------------
+    // Shown after a delete completes: lists what was removed and what could
+    // not be (e.g. permission errors).
+    if root.show-delete-results: Rectangle {
+        background: root.scrim;
+        TouchArea { clicked => { root.show-delete-results = false; } }
+        results-focus := FocusScope {
+            init => { results-focus.focus(); }
+            Timer {
+                interval: 1ms;
+                running: root.show-delete-results;
+                triggered => { results-focus.focus(); self.running = false; }
+            }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) { root.show-delete-results = false; }
+                accept
+            }
+            Rectangle {
+            width: min(root.width - 80px, 520px);
+            height: min(root.height - 80px, 560px);
+            background: root.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: root.hairline;
+            // Swallow clicks so they don't dismiss via the scrim.
+            TouchArea {}
+            VerticalBox {
+                padding: 16px;
+                spacing: 10px;
+                Text {
+                    text: "Delete results";
+                    font-size: 18px;
+                    font-weight: 700;
+                    color: root.text;
+                    horizontal-alignment: center;
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 12px;
+                        // Successfully deleted.
+                        if root.deleted-names != "": Rectangle {
+                            background: root.card;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: root.hairline;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 4px;
+                                Text {
+                                    text: "Deleted";
+                                    font-weight: 700;
+                                    color: root.text;
+                                }
+                                Text {
+                                    text: root.deleted-names;
+                                    color: root.muted;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        // Could not be deleted (permission or other errors).
+                        if root.failed-names != "": Rectangle {
+                            background: root.card;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: root.hairline;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 4px;
+                                Text {
+                                    text: "Could not delete";
+                                    font-weight: 700;
+                                    color: root.danger;
+                                }
+                                Text {
+                                    text: root.failed-names;
+                                    color: root.muted;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        // Nothing at all (shouldn't normally happen, but keep
+                        // the dialog meaningful).
+                        if root.deleted-names == "" && root.failed-names == "": Text {
+                            text: "Nothing was deleted.";
+                            color: root.muted;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                HorizontalBox {
+                    alignment: end;
+                    Button { text: "Close"; clicked => { root.show-delete-results = false; } }
+                }
+            }
+            }
+        }
+    }
+
+    // Toolbar-button tooltip. Rendered as the window's last child so it draws
+    // on top of the file list and other content.
+    if root.tip-text != "": Rectangle {
+        x: min(max(0px, root.tip-x), root.width - self.width);
+        y: min(root.tip-y, root.height - self.height);
+        width: overlay-tip.preferred-width + 12px;
+        height: overlay-tip.preferred-height + 8px;
+        background: root.dark ? #000000d0 : #ffffffe0;
+        border-radius: 5px;
+        border-width: 1px;
+        border-color: root.hairline;
+        overlay-tip := Text {
+            text: root.tip-text;
+            color: root.text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
 }
