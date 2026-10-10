@@ -535,7 +535,15 @@ mod tests {
 
     #[test]
     fn network_fs_detection() {
-        for fs in ["nfs", "NFS4", "smbfs", "cifs", "afpfs", "webdav", "fuse.sshfs"] {
+        for fs in [
+            "nfs",
+            "NFS4",
+            "smbfs",
+            "cifs",
+            "afpfs",
+            "webdav",
+            "fuse.sshfs",
+        ] {
             assert!(is_network_fs(fs), "{fs} should be network");
         }
         for fs in ["apfs", "ntfs", "ext4", "btrfs", "fuse.portal", ""] {
@@ -579,8 +587,10 @@ mod tests {
         // Merging OS-reported removable volumes with sysinfo's list must not
         // produce duplicate rows for the same mount point.
         for include_network in [false, true] {
-            let mut points: Vec<String> =
-                list(include_network).into_iter().map(|m| m.mount_point).collect();
+            let mut points: Vec<String> = list(include_network)
+                .into_iter()
+                .map(|m| m.mount_point)
+                .collect();
             points.sort();
             let total = points.len();
             points.dedup();
@@ -625,7 +635,9 @@ mod tests {
                 "root volume should always be listed"
             );
             assert!(
-                !listed.iter().any(|m| m.mount_point == "/System/Volumes/Data"),
+                !listed
+                    .iter()
+                    .any(|m| m.mount_point == "/System/Volumes/Data"),
                 "the firmlinked Data volume should be hidden"
             );
         }

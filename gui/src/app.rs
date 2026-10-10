@@ -641,7 +641,9 @@ fn open_volume_window(ctrl: &Rc<RefCell<Controller>>, main: &MainWindow, mount_p
     rescan_volume(&win, &state);
     let _ = win.show();
 
-    ctrl.borrow_mut().volume_windows.push(VolumeHandle { window: win });
+    ctrl.borrow_mut()
+        .volume_windows
+        .push(VolumeHandle { window: win });
 }
 
 /// Scan `state.current`, recompute wedges, and push them (plus the path and

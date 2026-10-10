@@ -274,9 +274,7 @@ fn wedge_commands(start_deg: f32, sweep_deg: f32) -> String {
         // Full circle: two half-arcs.
         let (sx, sy) = point_on_circle(0.0, r);
         let (mx, my) = point_on_circle(180.0, r);
-        return format!(
-            "M {sx} {sy} A {r} {r} 0 1 1 {mx} {my} A {r} {r} 0 1 1 {sx} {sy} Z"
-        );
+        return format!("M {sx} {sy} A {r} {r} 0 1 1 {mx} {my} A {r} {r} 0 1 1 {sx} {sy} Z");
     }
     let (sx, sy) = point_on_circle(start_deg, r);
     let (ex, ey) = point_on_circle(start_deg + sweep_deg, r);
@@ -371,7 +369,10 @@ mod tests {
         });
 
         // At least an initial snapshot plus one per directory (2).
-        assert!(totals.len() >= 3, "expected multiple progress updates, got {totals:?}");
+        assert!(
+            totals.len() >= 3,
+            "expected multiple progress updates, got {totals:?}"
+        );
         // Totals never shrink as directory sizes are added in.
         for w in totals.windows(2) {
             assert!(w[1] >= w[0], "total must not decrease: {totals:?}");
@@ -391,8 +392,18 @@ mod tests {
     fn wedges_cover_full_circle_and_carry_labels() {
         let scan = DirScan {
             entries: vec![
-                Entry { name: "a".into(), path: "/a".into(), is_dir: true, size_bytes: 75 },
-                Entry { name: "b".into(), path: "/b".into(), is_dir: false, size_bytes: 25 },
+                Entry {
+                    name: "a".into(),
+                    path: "/a".into(),
+                    is_dir: true,
+                    size_bytes: 75,
+                },
+                Entry {
+                    name: "b".into(),
+                    path: "/b".into(),
+                    is_dir: false,
+                    size_bytes: 25,
+                },
             ],
             total_bytes: 100,
         };
@@ -400,7 +411,10 @@ mod tests {
         assert_eq!(ws.len(), 2);
         // Sweeps are proportional and together span the full circle.
         let sum: f32 = ws.iter().map(|w| w.sweep_deg).sum();
-        assert!((sum - 360.0).abs() < 0.5, "sweeps should total ~360°, got {sum}");
+        assert!(
+            (sum - 360.0).abs() < 0.5,
+            "sweeps should total ~360°, got {sum}"
+        );
         assert!((ws[0].sweep_deg - 270.0).abs() < 0.5);
         assert_eq!(ws[0].start_deg, 0.0);
         assert!((ws[1].start_deg - 270.0).abs() < 0.5);
