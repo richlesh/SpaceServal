@@ -4649,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "spaceserval-gui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4678,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "spaceserval-launch"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",
