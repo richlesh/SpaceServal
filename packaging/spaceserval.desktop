@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SpaceServal
+Comment=SpaceServal desktop application
+Exec=spaceserval-gui %U
+Icon=spaceserval
+Terminal=false
+Categories=Utility;

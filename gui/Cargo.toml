@@ -1,0 +1,90 @@
+[package]
+name = "spaceserval-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Slint desktop frontend for SpaceServal"
+
+[[bin]]
+name = "spaceserval-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+slint = { version = "1.18", features = ["raw-window-handle-06"] }
+image.workspace = true
+chrono.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+
+# macOS: read the user's accent/selection colors and system font size via
+# AppKit so the UI matches the OS. Versions match Slint's winit backend objc2.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+objc2-foundation = { version = "0.2.2", features = ["NSString", "NSArray", "NSURL", "NSData", "NSGeometry"] }
+objc2-app-kit = { version = "0.2.2", features = ["NSColor", "NSColorSpace", "NSFont"] }
+raw-window-handle = "0.6"
+# Native macOS menu bar. Pinned to the exact version Slint 1.18's winit backend
+# depends on, so there is a single muda in the tree (its MenuEvent channel is a
+# process-global that both must agree on).
+muda = "=0.19.3"
+# We construct the winit backend ourselves on macOS to disable Slint's default
+# menu bar (otherwise it installs its own NSApp menu and hijacks muda's event
+# handler, so our native menu's clicks never reach us). Pinned to match Slint.
+i-slint-backend-winit = "=1.18.1"
+
+# Windows: read the user's accent / highlight colors (DWM + system colors) so
+# the app's highlights match the OS. Version matches Slint's winit backend.
+[target.'cfg(target_os = "windows")'.dependencies]
+# Storage_FileSystem / WindowsProgramming enumerate mapped network drives.
+windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+
+# macOS/Linux: getfsstat / statvfs to enumerate network mounts, which sysinfo
+# deliberately omits. Already in the tree via sysinfo.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux: read the XDG desktop-portal accent color over D-Bus. Version matches
+# Slint's winit backend.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.14", default-features = false, features = ["async-io", "blocking-api"] }
+
+# Windows: embed the .ico into the executable at build time.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+# Compile the .slint UI files into Rust at build time.
+[build-dependencies]
+slint-build = "1.18"
+
+# Package metadata for cargo-deb / cargo-generate-rpm (Linux installers).
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+depends = "libc6, libgcc-s1, libfontconfig1, libx11-6, libx11-xcb1, libxcb1, libxkbcommon0, libgl1"
+assets = [
+    ["target/release/spaceserval-gui", "usr/bin/", "755"],
+    ["../packaging/spaceserval.desktop", "usr/share/applications/", "644"],
+    ["src/resources/app_icon_256.png", "usr/share/icons/hicolor/256x256/apps/spaceserval.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/spaceserval-gui", dest = "/usr/bin/spaceserval-gui", mode = "755" },
+    { source = "../packaging/spaceserval.desktop", dest = "/usr/share/applications/spaceserval.desktop", mode = "644" },
+    { source = "src/resources/app_icon_256.png", dest = "/usr/share/icons/hicolor/256x256/apps/spaceserval.png", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+fontconfig = "*"
+libX11 = "*"
+libxkbcommon = "*"
+mesa-libGL = "*"

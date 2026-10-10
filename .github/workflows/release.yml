@@ -1,0 +1,368 @@
+name: Release
+
+on:
+  # Manual release: provide the version (e.g. 1.0.0). The tag is
+  # created and pushed by the workflow if it doesn't already exist.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+  # Also still runs when a matching tag is pushed directly.
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Run JavaScript-based actions on Node.js 24. The v5 artifact actions (and
+  # some others) still bundle a Node.js 20 runtime, which GitHub is
+  # deprecating; opting in now silences the warning and is forward-compatible.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Expose signing secrets as env so step `if:` conditions can detect whether
+    # signing is configured. When a secret is unset the corresponding signing
+    # step is skipped and the build is produced unsigned.
+    env:
+      APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      # The GUI's license salt. build.rs writes gui/src/license.rs from this
+      # when the (git-ignored) file is absent, as it is in CI.
+      LICENSE_SALT: ${{ secrets.LICENSE_SALT }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux x86-64 (built on 22.04 for a low glibc floor) ----
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            linux_pkg: true
+            cross: false
+          # ---- Linux ARM64 (cross-compiled) ----
+          - name: linux-aarch64
+            os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            linux_pkg: true
+            cross: true
+          # ---- macOS ARM64 ----
+          # (macOS x86-64 is intentionally not built: Intel macOS runners are
+          # scarce/slow to schedule. Apple Silicon builds cover current Macs;
+          # Intel Macs can run the arm64 build under Rosetta 2 if needed.)
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            linux_pkg: false
+            cross: false
+          # ---- Windows x86-64 ----
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            linux_pkg: false
+            cross: false
+          # ---- Windows ARM64 ----
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            linux_pkg: false
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Import the Developer ID Application certificate into a temporary
+      # keychain so the packaging step can codesign the .app and .dmg.
+      # Skipped automatically if the signing secret isn't configured, leaving
+      # an unsigned build.
+      - name: Import Developer ID certificate (macOS)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          KEYCHAIN_PASSWORD=build-keychain-password
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      # Native Linux GUI build deps (x86_64 host build).
+      - name: Install Linux build deps (native)
+        if: matrix.os == 'ubuntu-22.04' && matrix.cross == false
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libfontconfig-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxkbcommon-dev
+
+      # For aarch64 Linux we use `cross`, which builds inside a container with
+      # the correct cross sysroot. The target-arch GUI system libraries
+      # (fontconfig, X11, xkbcommon, GL) are installed into that container by
+      # the pre-build hook in Cross.toml.
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }} --workspace
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }} --workspace
+
+      # ---- Package: Linux .deb + .rpm ----
+      - name: Install packaging tools
+        if: matrix.linux_pkg == true
+        run: |
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+
+      - name: Build .deb
+        if: matrix.linux_pkg == true
+        run: |
+          cargo deb -p spaceserval-gui --no-build --target ${{ matrix.target }} --output dist/
+        # --no-build: reuse the release artifacts we already built above.
+
+      - name: Build .rpm
+        if: matrix.linux_pkg == true
+        run: |
+          mkdir -p dist
+          cargo generate-rpm -p gui --target ${{ matrix.target }} \
+            --output dist/spaceserval-${{ matrix.target }}.rpm
+
+      # ---- Package: macOS / Windows archives ----
+      # (No raw macOS binary tarball: loose executables are quarantined by
+      # Gatekeeper — "cannot verify … is free of malware". macOS ships only the
+      # notarized .dmg.)
+
+      # macOS: build a .app bundle (with the .icns icon) and a .dmg whose
+      # mounted volume shows the application icon. When a Developer ID identity
+      # is available the bundle is codesigned inside the script.
+      - name: Package macOS .app + .dmg
+        if: runner.os == 'macOS'
+        env:
+          # The bare identity name (after "Developer ID Application: "). If unset
+          # or mismatched, the script auto-detects the identity from the keychain.
+          SPACESERVAL_SIGN_IDENTITY_NAME: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SPACESERVAL_KEYCHAIN: ${{ runner.temp }}/build.keychain
+        run: |
+          packaging/macos_bundle.sh ${{ matrix.target }} dist
+          # Remove the unpacked bundle: the .dmg already contains the signed
+          # app, and leaving the directory would make the artifact upload
+          # recurse into it and publish its internals as loose assets.
+          rm -rf dist/SpaceServal.app
+
+      # Sign the DMG, submit it for notarization, and staple the ticket so the
+      # download runs on Gatekeeper without a network check. Skipped when the
+      # signing secret isn't configured (unsigned build).
+      - name: Sign DMG + notarize + staple (macOS)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          # Accept either a bare name or a full "Developer ID Application: ..."
+          # value in the secret; normalize to the full identity string.
+          NAME="${APPLE_SIGNING_IDENTITY#Developer ID Application: }"
+          IDENTITY="Developer ID Application: ${NAME}"
+          DMG="dist/SpaceServal-${{ matrix.target }}.dmg"
+
+          # Sign the disk image itself.
+          codesign --force --timestamp --sign "$IDENTITY" \
+            --keychain "$KEYCHAIN_PATH" "$DMG"
+
+          # Notarize using an App Store Connect API key.
+          KEY_FILE=$RUNNER_TEMP/AuthKey.p8
+          echo "$APPLE_API_KEY" > "$KEY_FILE"
+          xcrun notarytool submit "$DMG" \
+            --key "$KEY_FILE" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait | tee notarize_output.txt
+
+          # Surface the log and fail the job if notarization was rejected.
+          if grep -q "Invalid\|Rejected" notarize_output.txt; then
+            SUBMISSION_ID=$(grep -m1 "id:" notarize_output.txt | awk '{print $2}')
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$KEY_FILE" --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" || true
+            exit 1
+          fi
+
+          # Staple the ticket into the DMG.
+          xcrun stapler staple "$DMG"
+          rm -f "$KEY_FILE"
+
+      - name: Archive (linux binaries too)
+        if: matrix.linux_pkg == true
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/dist/spaceserval-${{ matrix.target }}.tar.gz" \
+            spaceserval-gui
+
+      # Sign the Windows executables with Azure Trusted Signing before they are
+      # zipped. Skipped when Azure isn't configured (unsigned build).
+      - name: Azure login (Windows)
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign executables (Windows)
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: target/${{ matrix.target }}/release
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Build a proper Windows installer (Inno Setup) from the signed binaries.
+      # Installs to Program Files; creates shortcuts. Produces
+      # SpaceServal-<arch>-Setup.exe.
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $arch = if ("${{ matrix.target }}" -like "aarch64*") { "arm64" } else { "x64" }
+          # Version for the installer's display: prefer the dispatch input or the
+          # pushed tag, else fall back to the workspace Cargo.toml version.
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version) { $version = "${{ github.ref_name }}" }
+          $version = $version -replace '^v',''
+          if (-not $version -or $version -notmatch '^\d+\.\d+\.\d+') {
+            $m = Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            $version = if ($m) { $m.Matches[0].Groups[1].Value } else { "0.0.0" }
+          }
+          $src = "$PWD/target/${{ matrix.target }}/release"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$version" `
+            "/DArch=$arch" `
+            "/DSourceDir=$src" `
+            "packaging/windows/spaceserval.iss"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "packaging/windows/SpaceServal-$arch-Setup.exe" "dist/"
+
+      # Sign the installer itself (the inner binaries were already signed above).
+      - name: Sign installer (Windows)
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: dist
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: spaceserval-${{ matrix.target }}
+          # Only publish finished archives/packages — never loose files (e.g.
+          # an unpacked .app bundle's internals). Windows ships the signed
+          # installer (.exe) only.
+          path: |
+            dist/*.dmg
+            dist/*.tar.gz
+            dist/*.exe
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: ignore
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Publish when a tag was pushed, or when manually dispatched with a version.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Resolve the release tag. On a tag push, use the pushed tag. On manual
+      # dispatch, normalize the input to a `vX.Y.Z` tag.
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            VERSION="${VERSION#v}"          # strip a leading v if present
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"  # e.g. refs/tags/v1.0.0 -> v1.0.0
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      # Create and push the tag if it doesn't already exist (manual dispatch).
+      - name: Create and push tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists locally; not recreating."
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists on origin; not recreating."
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "Created and pushed tag $TAG."
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: SpaceServal ${{ steps.tag.outputs.tag }}
+          files: artifacts/**/*
+          generate_release_notes: true

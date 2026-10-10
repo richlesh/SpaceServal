@@ -1,0 +1,628 @@
+// SpaceServal main window (Slint).
+//
+// A minimal shell window plus the shared Glowing Cat dialogs: About, Splash
+// (donation nag), License Key, and Settings. The main-window application logic
+// is intentionally not implemented here — this provides the surrounding chrome
+// and dialogs only.
+
+import {
+    Button,
+    CheckBox,
+    ComboBox,
+    LineEdit,
+    VerticalBox,
+    HorizontalBox,
+    Palette,
+} from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
+
+// One mounted volume shown in the main-window list. Populated by the Rust
+// controller from `mounts::list()`; the byte sizes are pre-formatted there.
+export struct MountInfo {
+    name: string,
+    mount-point: string,
+    file-system: string,
+    total: string,       // human-readable, e.g. "931 GB"
+    available: string,   // human-readable
+    used-fraction: float, // 0.0..=1.0 for the usage bar
+    removable: bool,
+    network: bool,       // SMB/NFS/AFP/… share
+}
+
+// App-wide theme colors, derived from the built-in Palette (whose color-scheme
+// the controller sets to match the Light/Dark setting). Custom surfaces (window
+// background, dialog cards, scrim, muted text, links) read from here so the
+// whole UI — not just the built-in widgets — follows the selected theme.
+export global Theme {
+    // True when the active color scheme is dark. Bound from MainWindow so the
+    // built-in Palette and our own colors stay in lockstep.
+    in property <bool> dark: true;
+
+    out property <brush> window-bg: Palette.background;
+    out property <brush> text: Palette.foreground;
+    out property <brush> muted-text: dark ? #9a9a9a : #666666;
+    out property <brush> card-bg: dark ? #262626 : #f4f4f4;
+    out property <brush> border: dark ? #4a4a4a : #cccccc;
+    out property <brush> scrim: dark ? #000000c0 : #00000060;
+    out property <brush> link: dark ? #5c9dff : #0a58ca;
+    out property <brush> link-hover: dark ? #7fb0ff : #3b7dd8;
+    out property <brush> hairline: dark ? #666666 : #cccccc;
+    out property <brush> hover-row: dark ? #ffffff14 : #00000010;
+    out property <brush> error-text: dark ? #e0a0a0 : #b00020;
+    out property <brush> placeholder-text: dark ? #999999 : #888888;
+    // System selection/highlight colors. The controller reads the real OS
+    // colors and pushes them in here so the whole UI matches the user's chosen
+    // accent/highlight color. When `has-sys-colors` is false we fall back to
+    // Slint's Palette defaults.
+    in property <bool> has-sys-colors: false;
+    in property <brush> sys-highlight: #808080;
+    in property <brush> sys-highlight-text: #ffffff;
+    in property <brush> sys-accent: #808080;
+
+    out property <brush> highlight: has-sys-colors ? sys-highlight : Palette.selection-background;
+    out property <brush> highlight-text: has-sys-colors ? sys-highlight-text : Palette.selection-foreground;
+    // Accent used for filled indicators.
+    out property <brush> accent: has-sys-colors ? sys-accent : Palette.selection-background;
+}
+
+// A clickable text link. Emits `open-url` with the URL to open.
+component Hyperlink inherits TouchArea {
+    in property <string> text;
+    in property <string> url;
+    callback open-url(string);
+    mouse-cursor: pointer;
+    Text {
+        text: root.text;
+        color: touch-hover ? Theme.link-hover : Theme.link;
+        horizontal-alignment: center;
+    }
+    property <bool> touch-hover: root.has-hover;
+    clicked => { root.open-url(root.url); }
+}
+
+// A full-window dark scrim with a centered card. `dismiss` fires when the
+// scrim (outside the card) is clicked.
+component DialogScrim inherits Rectangle {
+    callback dismiss();
+    background: Theme.scrim;
+    // Catch clicks on the scrim so they don't fall through to the window.
+    TouchArea {
+        clicked => { root.dismiss(); }
+    }
+    @children
+}
+
+// A single-line text field styled to match the dialogs, built on the core
+// `TextInput` so it exposes clipboard functions (`cut`/`copy`/`paste`/
+// `select-all`). The stock std-widgets `LineEdit` does not re-export those, so
+// the Windows/Linux Edit menu drives these fields instead. The Edit menu bumps
+// `edit-serial` (with `edit-op`); each field watches it and, when it holds
+// focus, performs the op. It also provides the built-in right-click clipboard
+// menu, which works independently of the menu bar.
+component ClipField inherits Rectangle {
+    in property <string> placeholder-text;
+    in-out property <string> text <=> ti.text;
+    in property <bool> password: false;
+    // Edit-menu broadcast, bound from the Window. op: 1=cut 2=copy 3=paste
+    // 4=select-all; serial increments on each request.
+    in property <int> edit-op;
+    in property <int> edit-serial;
+    callback accepted();
+    callback edited();
+
+    // Perform the broadcast op, but only for the field that currently has
+    // focus, so exactly one field responds.
+    changed edit-serial => {
+        if ti.has-focus {
+            if root.edit-op == 1 { ti.cut(); }
+            if root.edit-op == 2 { ti.copy(); }
+            if root.edit-op == 3 { ti.paste(); }
+            if root.edit-op == 4 { ti.select-all(); }
+        }
+    }
+
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.accent : Theme.border;
+    background: Theme.window-bg;
+    forward-focus: ti;
+
+    Text {
+        x: 8px;
+        vertical-alignment: center;
+        text: (ti.text == "" && ti.preedit-text == "") ? root.placeholder-text : "";
+        color: Theme.placeholder-text;
+    }
+
+    ContextMenuArea {
+        Menu {
+            MenuItem { title: "Cut"; activated => { ti.cut(); } }
+            MenuItem { title: "Copy"; activated => { ti.copy(); } }
+            MenuItem { title: "Paste"; activated => { ti.paste(); } }
+            MenuItem { title: "Select All"; activated => { ti.select-all(); } }
+        }
+        ti := TextInput {
+            x: 8px;
+            width: parent.width - 16px;
+            height: 100%;
+            vertical-alignment: center;
+            single-line: true;
+            color: Theme.text;
+            selection-background-color: Theme.highlight;
+            selection-foreground-color: Theme.highlight-text;
+            input-type: root.password ? InputType.password : InputType.text;
+            accepted => { root.accepted(); }
+            edited => { root.edited(); }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "SpaceServal";
+    preferred-width: 720px;
+    preferred-height: 480px;
+    min-width: 480px;
+    min-height: 320px;
+    icon: root.window-icon;
+    background: Theme.window-bg;
+
+    // Theme + font-size plumbing.
+    in property <bool> theme-dark: true;
+    in property <length> base-font-size: 15px;
+    default-font-size: root.base-font-size;
+
+    // Theme: the controller sets `theme-dark` from the persisted Light/Dark
+    // setting; we propagate it to the `Theme` global (our custom colors) and
+    // the built-in widget `Palette` on init and whenever it changes, keeping
+    // std-widgets and custom surfaces in lockstep.
+    init => {
+        Theme.dark = root.theme-dark;
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    changed theme-dark => {
+        Theme.dark = root.theme-dark;
+        Palette.color-scheme = root.theme-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    // ---- Dialog state --------------------------------------------------
+    in property <image> app-icon;                 // 96px icon for dialogs
+    in property <image> window-icon;              // window/taskbar icon
+    in property <string> app-version;
+    in property <bool> show-about: false;
+    in property <bool> about-licensed: false;
+    in property <bool> show-splash: false;
+    in property <bool> show-license: false;
+    in-out property <string> license-email;
+    in-out property <string> license-key;
+    in property <bool> license-valid: false;
+    in property <string> license-msg;
+    in property <bool> show-settings: false;
+    in-out property <string> settings-token;
+    // Theme selector: 0 = Light, 1 = Dark (matches the Settings ComboBox model).
+    in-out property <int> settings-theme-index: 1;
+    // Font size selector: 0 = System, 1 = Small, 2 = Medium, 3 = Large.
+    in-out property <int> settings-font-index: 0;
+    // "Show Network Shares" checkbox: include network mounts in the list.
+    in-out property <bool> settings-show-network: false;
+    in-out property <string> status;
+
+    // Mounted drives / mount points shown in the main window. Filled by the
+    // controller; `refresh-mounts` asks it to re-enumerate.
+    in property <[MountInfo]> mounts: [];
+    callback refresh-mounts();
+
+    // True on platforms that use the Slint declarative menu bar (Windows and
+    // Linux). On macOS the native menu bar is built directly with muda from the
+    // Rust side, so this is left false there to avoid two competing menu bars.
+    in property <bool> use-slint-menubar: false;
+
+    // Edit-menu broadcast. The Edit menu bumps `edit-serial` and sets
+    // `edit-op` (1=cut, 2=copy, 3=paste, 4=select-all). Every ClipField watches
+    // the serial and, if it currently has focus, performs the op. This avoids
+    // referencing dialog field ids from here (they live inside `if` blocks and
+    // are out of scope). Dialogs are modal/one-at-a-time, so at most one field
+    // has focus.
+    property <int> edit-op: 0;
+    property <int> edit-serial: 0;
+
+    // ---- Callbacks (wired to the controller) --------------------------
+    callback open-settings();
+    callback open-license();
+    callback open-about();
+    callback quit();
+    callback open-url(string);
+    callback about-ok();
+    callback splash-dismiss();
+    callback license-cancel();
+    callback license-key-edited();
+    callback license-save();
+    callback settings-cancel();
+    callback settings-save();
+    callback theme-changed(int);
+    callback font-size-changed(int);
+
+    // ---- Edit-menu routing (Windows/Linux) ----------------------------
+    // Broadcast an op to the focused ClipField by bumping the serial. See the
+    // `edit-op`/`edit-serial` properties above.
+    function edit-cut() { root.edit-op = 1; root.edit-serial += 1; }
+    function edit-copy() { root.edit-op = 2; root.edit-serial += 1; }
+    function edit-paste() { root.edit-op = 3; root.edit-serial += 1; }
+    function edit-select-all() { root.edit-op = 4; root.edit-serial += 1; }
+
+    // ---- Main window shell --------------------------------------------
+    // Windows/Linux menu bar. Guarded so it is only built off-macOS; on macOS
+    // the native menu is created with muda in Rust (see menu_macos.rs). There
+    // is no OS "Application menu" on these platforms, so About/Settings live in
+    // a leading app-named menu and License Key lives under Help.
+    if root.use-slint-menubar: MenuBar {
+        Menu {
+            title: "SpaceServal";
+            MenuItem {
+                title: "About SpaceServal";
+                activated => { root.open-about(); }
+            }
+            MenuItem {
+                title: "Settings…";
+                activated => { root.open-settings(); }
+            }
+            MenuItem {
+                title: "Quit";
+                activated => { root.quit(); }
+            }
+        }
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Close Window";
+                activated => { root.quit(); }
+            }
+        }
+        Menu {
+            title: "Edit";
+            MenuItem {
+                title: "Cut";
+                activated => { root.edit-cut(); }
+            }
+            MenuItem {
+                title: "Copy";
+                activated => { root.edit-copy(); }
+            }
+            MenuItem {
+                title: "Paste";
+                activated => { root.edit-paste(); }
+            }
+            MenuItem {
+                title: "Select All";
+                activated => { root.edit-select-all(); }
+            }
+        }
+        Menu {
+            title: "Help";
+            MenuItem {
+                title: "License Key…";
+                activated => { root.open-license(); }
+            }
+        }
+    }
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+        alignment: start;
+
+        HorizontalBox {
+            alignment: center;
+            padding: 0px;
+            Image { source: root.app-icon; width: 96px; height: 96px; }
+        }
+        Text {
+            text: "SpaceServal";
+            font-size: 24px;
+            font-weight: 700;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Version " + root.app-version;
+            color: Theme.muted-text;
+            horizontal-alignment: center;
+        }
+
+        // ---- Mounted drives / mount points -----------------------------
+        HorizontalBox {
+            padding: 0px;
+            Text {
+                text: "Mounted volumes";
+                font-weight: 700;
+                color: Theme.text;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Refresh";
+                clicked => { root.refresh-mounts(); }
+            }
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for m in root.mounts: Rectangle {
+                height: row.preferred-height + 12px;
+                background: touch.has-hover ? Theme.hover-row : transparent;
+                touch := TouchArea { }
+                row := HorizontalBox {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 12px;
+
+                    // Left: name + path + filesystem.
+                    VerticalBox {
+                        padding: 0px;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: m.name == "" ? m.mount-point : m.name;
+                            color: Theme.text;
+                            font-weight: 700;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: m.mount-point
+                                + (m.file-system == "" ? "" : "  •  " + m.file-system)
+                                + (m.removable ? "  •  removable" : "")
+                                + (m.network ? "  •  network" : "");
+                            color: Theme.muted-text;
+                            overflow: elide;
+                        }
+                        // Usage bar.
+                        Rectangle {
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.hairline;
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * m.used-fraction;
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: Theme.accent;
+                            }
+                        }
+                    }
+
+                    // Right: free / total.
+                    VerticalBox {
+                        padding: 0px;
+                        spacing: 2px;
+                        alignment: center;
+                        Text {
+                            text: m.available + " free";
+                            color: Theme.text;
+                            horizontal-alignment: right;
+                        }
+                        Text {
+                            text: "of " + m.total;
+                            color: Theme.muted-text;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.mounts.length == 0: Text {
+            text: "No mounted volumes found.";
+            color: Theme.muted-text;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: root.status;
+            color: Theme.muted-text;
+            horizontal-alignment: left;
+        }
+    }
+
+    // ---- About ----------------------------------------------------------
+    if root.show-about: DialogScrim {
+        dismiss => { root.about-ok(); }
+        Rectangle {
+            width: 280px;
+            height: about-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            about-col := VerticalBox {
+                alignment: center;
+                spacing: 6px;
+                padding: 16px;
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Image { source: root.app-icon; width: 96px; height: 96px; }
+                }
+                Text { text: "SpaceServal"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
+                Text { text: "©2026 Richard Lesh"; color: Theme.muted-text; horizontal-alignment: center; }
+                Text { text: "Built with Slint"; color: Theme.muted-text; horizontal-alignment: center; }
+                Hyperlink {
+                    text: "Glowing Cat Software";
+                    url: "https://glowingcat.com/SpaceServal.html";
+                    open-url(u) => { root.open-url(u); }
+                }
+                Hyperlink {
+                    text: "Report issues on GitHub";
+                    url: "https://github.com/richlesh/SpaceServal/issues";
+                    open-url(u) => { root.open-url(u); }
+                }
+                if root.about-licensed: Text {
+                    text: "Thank you for donating to\nGlowing Cat Software!";
+                    color: Theme.text;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Button { text: "OK"; min-width: 90px; clicked => { root.about-ok(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Splash (startup / donation nag) --------------------------------
+    if root.show-splash: DialogScrim {
+        dismiss => { root.splash-dismiss(); }
+        Rectangle {
+            width: 280px;
+            height: splash-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            splash-col := VerticalBox {
+                alignment: center;
+                spacing: 6px;
+                padding: 16px;
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Image { source: root.app-icon; width: 96px; height: 96px; }
+                }
+                Text { text: "SpaceServal"; font-size: 20px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Version " + root.app-version; color: Theme.muted-text; horizontal-alignment: center; }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Text {
+                        text: "If you enjoy using this product please consider donating to help fund this and other open source projects.";
+                        color: Theme.text;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        max-width: 200px;
+                    }
+                }
+                Hyperlink {
+                    text: "Donate at Glowing Cat Software";
+                    url: "https://glowingcat.com/SpaceServal.html";
+                    open-url(u) => { root.open-url(u); }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    alignment: center;
+                    Button { text: "OK"; min-width: 90px; clicked => { root.splash-dismiss(); } }
+                }
+            }
+        }
+    }
+
+    // ---- License Key ----------------------------------------------------
+    if root.show-license: DialogScrim {
+        dismiss => { root.license-cancel(); }
+        Rectangle {
+            width: 360px;
+            height: lic-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            lic-col := VerticalBox {
+                alignment: start;
+                spacing: 8px;
+                padding: 16px;
+                Text { text: "License Key"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                Text { text: "Enter your email address and license key"; color: Theme.muted-text; horizontal-alignment: center; wrap: word-wrap; }
+                ClipField {
+                    placeholder-text: "Your email address";
+                    text <=> root.license-email;
+                    edit-op: root.edit-op;
+                    edit-serial: root.edit-serial;
+                    edited => { root.license-key-edited(); }
+                }
+                ClipField {
+                    placeholder-text: "XXXX-XXXX-XXXX-XXXX";
+                    text <=> root.license-key;
+                    edit-op: root.edit-op;
+                    edit-serial: root.edit-serial;
+                    edited => { root.license-key-edited(); }
+                    accepted => { if root.license-valid { root.license-save(); } }
+                }
+                Hyperlink {
+                    text: "Donate at Glowing Cat Software to get a license key.";
+                    url: "https://glowingcat.com/SpaceServal.html";
+                    open-url(u) => { root.open-url(u); }
+                }
+                if root.license-msg != "": Text { text: root.license-msg; color: Theme.error-text; wrap: word-wrap; }
+                HorizontalBox {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.license-cancel(); } }
+                    Button { text: "Save"; enabled: root.license-valid; clicked => { root.license-save(); } }
+                }
+            }
+        }
+    }
+
+    // ---- Settings -------------------------------------------------------
+    if root.show-settings: DialogScrim {
+        dismiss => { root.settings-cancel(); }
+        Rectangle {
+            width: 400px;
+            height: set-col.preferred-height + 32px;
+            background: Theme.card-bg;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            set-col := VerticalBox {
+                alignment: start;
+                spacing: 8px;
+                padding: 16px;
+                Text { text: "Settings"; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "Theme"; color: Theme.text; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: ["Light", "Dark"];
+                        current-index <=> root.settings-theme-index;
+                        // Apply live so the user sees the change immediately.
+                        selected(v) => { root.theme-changed(self.current-index); }
+                    }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 8px;
+                    Text { text: "Font Size"; color: Theme.text; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: ["System", "Small", "Medium", "Large"];
+                        current-index <=> root.settings-font-index;
+                        // Apply live so the user sees the change immediately.
+                        selected(v) => { root.font-size-changed(self.current-index); }
+                    }
+                }
+                CheckBox {
+                    text: "Show Network Shares";
+                    checked <=> root.settings-show-network;
+                }
+                Text { text: "API Token"; color: Theme.text; }
+                ClipField {
+                    placeholder-text: "Paste your API token";
+                    password: true;
+                    text <=> root.settings-token;
+                    edit-op: root.edit-op;
+                    edit-serial: root.edit-serial;
+                    accepted => { root.settings-save(); }
+                }
+                HorizontalBox {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.settings-cancel(); } }
+                    Button { text: "Save"; clicked => { root.settings-save(); } }
+                }
+            }
+        }
+    }
+}

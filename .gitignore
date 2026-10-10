@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+
+# Local secrets / config
+.env
+*.local
+# License salt (secret; provided out-of-band / via CI)
+gui/src/license.rs
+# License key generator (kept local; not distributed)
+generate_license_key.py
+
+# Editor
+.idea/
+.vscode/
+*.swp

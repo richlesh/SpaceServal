@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Run JavaScript-based actions on Node.js 24. The v5 artifact actions (and
+  # some others) still bundle a Node.js 20 runtime, which GitHub is
+  # deprecating; opting in now silences the warning and is forward-compatible.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libfontconfig-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxkbcommon-dev
+
+      # gui/src/license.rs holds the license salt and is git-ignored, so it's
+      # absent on a fresh checkout. build.rs regenerates it for `cargo build`,
+      # but `cargo fmt` does not run build scripts and would fail to resolve
+      # `mod license;`. Create it here (from the LICENSE_SALT secret, or a
+      # placeholder) so fmt/clippy/test can all resolve the module.
+      - name: Generate gui/src/license.rs
+        shell: bash
+        env:
+          LICENSE_SALT: ${{ secrets.LICENSE_SALT }}
+        run: |
+          if [ ! -f gui/src/license.rs ]; then
+            SALT="${LICENSE_SALT:-UNSET-BUILD-SALT}"
+            printf 'pub const LICENSE_SALT: &str = "%s";\n' "$SALT" > gui/src/license.rs
+          fi
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["gui", "launch"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+authors = ["SpaceServal contributors"]
+repository = "https://github.com/yourname/spaceserval"
+description = "SpaceServal desktop application"
+
+[workspace.dependencies]
+# Shared
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+
+# Images / artwork
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Platform paths
+dirs = "7"
+
+# License-key HMAC validation
+hmac = "0.12"
+sha2 = "0.10"
+
+# Enumerate mounted drives / mount points and their capacity (cross-platform).
+sysinfo = { version = "0.39", default-features = false, features = ["disk"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
